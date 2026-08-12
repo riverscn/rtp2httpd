@@ -5,6 +5,8 @@ Tests verify basic connectivity, TS payload correctness, and the RTSP
 handshake sequence for both transport modes.
 """
 
+import os
+
 import pytest
 from helpers import (
     MockRTSPServer,
@@ -27,10 +29,40 @@ _STREAM_TIMEOUT = 20.0
 def shared_r2h(r2h_binary):
     """A single rtp2httpd instance shared by all transport tests."""
     port = find_free_port()
-    r2h = R2HProcess(r2h_binary, port, extra_args=["-v", "4", "-m", "100"])
+    env = os.environ.copy()
+    env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+    r2h = R2HProcess(r2h_binary, port, extra_args=["-v", "4", "-m", "100"], env=env)
     r2h.start()
     yield r2h
     r2h.stop()
+
+
+def test_refplayer_timeshift_is_explicit_daemon_opt_in(r2h_binary):
+    """Time-shift APIs are opt-in; ordinary RTSP playback remains unchanged."""
+    port = find_free_port()
+    env = os.environ.copy()
+    env.pop("RTP2HTTPD_REFPLAYER_TIMESHIFT", None)
+    r2h = R2HProcess(r2h_binary, port, extra_args=["-v", "4", "-m", "100"], env=env)
+    sdp = (
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=T\r\nt=0 0\r\n"
+        "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:*\r\n"
+    )
+    rtsp = MockRTSPServer(num_packets=500, custom_sdp=sdp)
+    rtsp.start()
+    try:
+        r2h.start()
+        status, _, body = stream_get(
+            "127.0.0.1",
+            r2h.port,
+            "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+            read_bytes=4096,
+            timeout=_STREAM_TIMEOUT,
+        )
+        assert status == 200
+        assert body
+    finally:
+        r2h.stop()
+        rtsp.stop()
 
 
 # ===================================================================
@@ -54,6 +86,43 @@ class TestRTSPTCPStream:
             )
             assert status == 200, "Expected 200 for TCP interleaved RTSP"
             assert len(body) > 0
+        finally:
+            rtsp.stop()
+
+    def test_tcp_media_before_failed_play_never_commits_http_200(self, shared_r2h):
+        rtsp = MockRTSPServer(num_packets=0, media_before_play_packets=5, play_status=454)
+        rtsp.start()
+        try:
+            status, _, _ = stream_get(
+                "127.0.0.1",
+                shared_r2h.port,
+                "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+                read_bytes=4096,
+                timeout=_STREAM_TIMEOUT,
+            )
+            assert status == 503
+        finally:
+            rtsp.stop()
+
+    def test_mp2t_rtp_sdp_and_setup_profile_are_accepted(self, shared_r2h):
+        sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=T\r\nt=0 0\r\nm=video 0 MP2T/RTP/AVP 33\r\na=control:*\r\n"
+        rtsp = MockRTSPServer(
+            num_packets=500,
+            custom_sdp=sdp,
+            setup_transport="MP2T/RTP/TCP;unicast;interleaved=0-1",
+        )
+        rtsp.start()
+        try:
+            status, headers, body = stream_get(
+                "127.0.0.1",
+                shared_r2h.port,
+                "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+                read_bytes=4096,
+                timeout=_STREAM_TIMEOUT,
+            )
+            assert status == 200
+            assert body
+            assert headers["r2h-upstream-payload"] == "mp2t-rtp"
         finally:
             rtsp.stop()
 
@@ -116,6 +185,29 @@ class TestRTSPTCPStream:
             assert get_header(headers, "R2H-Upstream-Transport") == ""
             assert get_header(headers, "R2H-Playback-Scale") == ""
             assert get_header(headers, "R2H-Playback-Range") == ""
+            assert rtsp.requests_received == ["OPTIONS", "DESCRIBE"]
+        finally:
+            rtsp.stop()
+
+    def test_timeshift_tracking_never_changes_metadata_only_head(self, shared_r2h):
+        sdp = (
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=T\r\nt=0 0\r\n"
+            "m=video 0 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\na=control:*\r\n"
+        )
+        rtsp = MockRTSPServer(custom_sdp=sdp)
+        rtsp.start()
+        try:
+            status, headers, body = http_request(
+                "127.0.0.1",
+                shared_r2h.port,
+                "HEAD",
+                "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+                timeout=10.0,
+            )
+            assert status == 200
+            assert body == b""
+            assert get_header(headers, "R2H-Upstream-Protocol") == "rtsp"
+            assert get_header(headers, "R2H-Upstream-Payload") == ""
             assert rtsp.requests_received == ["OPTIONS", "DESCRIBE"]
         finally:
             rtsp.stop()
@@ -353,8 +445,9 @@ class TestRTSPTCPStream:
             assert body == b""
             assert get_header(headers, "R2H-Upstream-Protocol") == "rtsp"
             assert get_header(headers, "R2H-Media-Duration") == "7.5"
-            # MP2T/AVP is not RTP-encapsulated, and a HEAD sees no media, so the
-            # payload must be absent rather than the pre-redirect mp2t-rtp.
+            # Generic MP2T/AVP is not RTP-encapsulated, and a HEAD sees no
+            # media, so the payload must be absent rather than inherited from
+            # the pre-redirect mp2t-rtp response.
             assert get_header(headers, "R2H-Upstream-Payload") == ""
             assert target.requests_received == ["OPTIONS", "DESCRIBE"]
         finally:
@@ -412,10 +505,17 @@ class TestRTSPTCPStream:
         finally:
             rtsp.stop()
 
-    def test_stream_sdp_alone_does_not_decide_payload(self, shared_r2h):
-        """A non-RTP SDP must not veto mp2t-rtp when the media is RTP after all."""
-        sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=T\r\nt=0 0\r\nm=video 0 MP2T/AVP 33\r\na=control:*\r\n"
-        rtsp = MockRTSPServer(num_packets=500, custom_sdp=sdp)
+    @pytest.mark.parametrize("server_header", ["HMS_V1R2", "GenericRTSP/1.0"])
+    def test_mp2t_avp_defers_rtp_wrapping_to_setup(self, shared_r2h, server_header):
+        """SETUP is authoritative regardless of the RTSP server brand."""
+        sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=live\r\nt=0 0\r\na=range:clock=0-\r\nm=video 0 MP2T/AVP 33\r\n"
+        rtsp = MockRTSPServer(
+            num_packets=500,
+            custom_sdp=sdp,
+            options_session_id="hms-session",
+            server_header=server_header,
+            setup_transport="MP2T/RTP/TCP;unicast;interleaved=0-1;source=127.0.0.1",
+        )
         rtsp.start()
         try:
             status, headers, body = stream_get(
@@ -427,7 +527,35 @@ class TestRTSPTCPStream:
             )
             assert status == 200
             assert body
+            assert headers["r2h-upstream-transport"] == "tcp-interleaved"
             assert headers["r2h-upstream-payload"] == "mp2t-rtp"
+        finally:
+            rtsp.stop()
+
+    def test_head_exposes_neutral_rtsp_profile_facts(self, shared_r2h):
+        """The Host classifies vendor/range facts; the helper only reports them."""
+        sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=live\r\nt=0 0\r\na=range:clock=0-\r\nm=video 0 MP2T/AVP 33\r\n"
+        rtsp = MockRTSPServer(
+            num_packets=500,
+            custom_sdp=sdp,
+            server_header="HMS_V1R2",
+            timeshift_status=1,
+        )
+        rtsp.start()
+        try:
+            status, headers, body = http_request(
+                "127.0.0.1",
+                shared_r2h.port,
+                "HEAD",
+                f"/rtsp/127.0.0.1:{rtsp.port}/stream",
+                timeout=_STREAM_TIMEOUT,
+            )
+            assert status == 200
+            assert body == b""
+            assert get_header(headers, "R2H-RTSP-Server") == "HMS_V1R2"
+            assert get_header(headers, "R2H-RTSP-Describe-Range") == "clock"
+            assert get_header(headers, "R2H-RTSP-Timeshift-Status") == "1"
+            assert rtsp.requests_received == ["OPTIONS", "DESCRIBE"]
         finally:
             rtsp.stop()
 
@@ -518,6 +646,21 @@ class TestRTSPUDPStream:
             assert headers["r2h-upstream-protocol"] == "rtsp"
             assert headers["r2h-upstream-transport"] == "udp"
             assert headers["r2h-upstream-payload"] == "mp2t-rtp"
+        finally:
+            rtsp.stop()
+
+    def test_udp_media_before_failed_play_never_commits_http_200(self, shared_r2h):
+        rtsp = MockRTSPServerUDP(num_packets=0, media_before_play_packets=5, play_status=454)
+        rtsp.start()
+        try:
+            status, _, _ = stream_get(
+                "127.0.0.1",
+                shared_r2h.port,
+                "/rtsp/127.0.0.1:%d/stream" % rtsp.port,
+                read_bytes=4096,
+                timeout=_STREAM_TIMEOUT,
+            )
+            assert status == 503
         finally:
             rtsp.stop()
 

@@ -4,6 +4,7 @@
 #include "http.h"
 #include "http_fetch.h"
 #include "md5.h"
+#include "refplayer_rtsp_timeshift.h"
 #include "service.h"
 #include "url_template.h"
 #include "utils.h"
@@ -1880,6 +1881,19 @@ const m3u_catalog_channel_t *m3u_catalog_find_source(const char *source_id) {
   return NULL;
 }
 
+const m3u_catalog_channel_t *m3u_catalog_find_live_service(const char *service_name) {
+  const m3u_catalog_channel_t *match = NULL;
+  if (!service_name || !service_name[0])
+    return NULL;
+  for (m3u_catalog_channel_t *channel = m3u_cache.catalog_channels; channel; channel = channel->next)
+    if (channel->service_name && strcmp(channel->service_name, service_name) == 0) {
+      if (match)
+        return NULL;
+      match = channel;
+    }
+  return match;
+}
+
 int m3u_refplayer_is_ready(void) { return !config.external_m3u_url || m3u_cache.external_catalog_ready; }
 
 char *m3u_generate_refplayer_catalog(const char *host_header, const char *x_forwarded_host,
@@ -1966,7 +1980,10 @@ fail:
   return NULL;
 }
 
-void m3u_reset_transformed_playlist(void) { free_transformed_m3u_buffer(&m3u_cache); }
+void m3u_reset_transformed_playlist(void) {
+  refplayer_rtsp_timeshift_clear();
+  free_transformed_m3u_buffer(&m3u_cache);
+}
 
 int m3u_cache_snapshot(m3u_cache_t *snapshot) {
   if (!snapshot)
@@ -2008,11 +2025,13 @@ void m3u_cache_restore_snapshot(m3u_cache_t *snapshot) {
     return;
 
   free_transformed_m3u_buffer(&m3u_cache);
+  refplayer_rtsp_timeshift_clear();
   m3u_cache = *snapshot;
   memset(snapshot, 0, sizeof(*snapshot));
 }
 
 void m3u_reset_external_playlist(void) {
+  refplayer_rtsp_timeshift_clear();
   /* Truncate buffer to inline content only (for external reload) */
   if (m3u_cache.transformed_m3u && m3u_cache.transformed_m3u_inline_end < m3u_cache.transformed_m3u_used) {
     /* Reset used size to inline end position */

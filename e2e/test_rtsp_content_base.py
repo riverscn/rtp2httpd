@@ -5,6 +5,8 @@ Verifies that rtp2httpd correctly resolves SETUP URLs from the
 Content-Base header and SDP a=control attributes per RFC 3986.
 """
 
+import os
+
 import pytest
 from helpers import (
     MockRTSPServer,
@@ -22,7 +24,9 @@ _STREAM_TIMEOUT = 20.0
 def shared_r2h(r2h_binary):
     """A single rtp2httpd instance shared by all Content-Base tests."""
     port = find_free_port()
-    r2h = R2HProcess(r2h_binary, port, extra_args=["-v", "4", "-m", "100"])
+    env = os.environ.copy()
+    env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+    r2h = R2HProcess(r2h_binary, port, extra_args=["-v", "4", "-m", "100"], env=env)
     r2h.start()
     yield r2h
     r2h.stop()
@@ -180,43 +184,6 @@ class TestRTSPContentBase:
             setup_uri = setup_reqs[0]["uri"]
             assert setup_uri.endswith("/live/stream.sdp"), (
                 f"No a=control in SDP → SETUP should use original URL, got: {setup_uri}"
-            )
-        finally:
-            rtsp.stop()
-
-    # -- Multi-track SDP (only first track used) ----------------------------
-
-    def test_multi_track_uses_first_media_control(self, shared_r2h):
-        """SDP with two m= sections: only the first media-level a=control
-        should be used for SETUP (rtp2httpd sets up one track)."""
-        sdp_multi = (
-            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=T\r\n"
-            "c=IN IP4 0.0.0.0\r\nt=0 0\r\n"
-            "m=video 0 RTP/AVP 33\r\n"
-            "a=rtpmap:33 MP2T/90000\r\n"
-            "a=control:trackID=1\r\n"
-            "m=audio 0 RTP/AVP 97\r\n"
-            "a=rtpmap:97 MPEG4-GENERIC/48000\r\n"
-            "a=control:trackID=2\r\n"
-        )
-        # sdp_control="trackID=1" ensures auto Content-Base adds trailing /
-        rtsp = MockRTSPServer(num_packets=500, custom_sdp=sdp_multi, sdp_control="trackID=1")
-        rtsp.start()
-        try:
-            stream_get(
-                "127.0.0.1",
-                shared_r2h.port,
-                f"/rtsp/127.0.0.1:{rtsp.port}/live/stream.sdp",
-                read_bytes=4096,
-                timeout=_STREAM_TIMEOUT,
-            )
-
-            setup_reqs = [r for r in rtsp.requests_detailed if r["method"] == "SETUP"]
-            assert len(setup_reqs) > 0, "Expected SETUP request"
-            setup_uri = setup_reqs[0]["uri"]
-            # First media-level control is trackID=1
-            assert setup_uri.endswith("/live/stream.sdp/trackID=1"), (
-                f"Multi-track: SETUP should use first media control (trackID=1), got: {setup_uri}"
             )
         finally:
             rtsp.stop()

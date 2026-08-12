@@ -5,6 +5,7 @@
 #include "http.h"
 #include "http_proxy.h"
 #include "multicast.h"
+#include "refplayer_rtsp_timeshift.h"
 #include "rtp.h"
 #include "rtp_fec.h"
 #include "rtsp.h"
@@ -23,7 +24,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define STREAM_METADATA_HEADERS_SIZE 1024
+#define STREAM_METADATA_HEADERS_SIZE 1536
 #define TS_PACKET_SIZE 188
 #define TS_SYNC_BYTE 0x47
 
@@ -34,6 +35,9 @@ enum {
   STREAM_HDR_UPSTREAM_PROTOCOL = 0,
   STREAM_HDR_UPSTREAM_TRANSPORT,
   STREAM_HDR_UPSTREAM_PAYLOAD,
+  STREAM_HDR_RTSP_SERVER,
+  STREAM_HDR_RTSP_DESCRIBE_RANGE_UNIT,
+  STREAM_HDR_RTSP_TIMESHIFT_STATUS,
   STREAM_HDR_PLAYBACK_SCALE,
   STREAM_HDR_PLAYBACK_RANGE,
   STREAM_HDR_MEDIA_DURATION,
@@ -43,8 +47,10 @@ enum {
 };
 
 static const char *const stream_metadata_header_names[STREAM_HDR_COUNT] = {
-    "R2H-Upstream-Protocol", "R2H-Upstream-Transport", "R2H-Upstream-Payload", "R2H-Playback-Scale",
-    "R2H-Playback-Range",    "R2H-Media-Duration",     "R2H-FCC-Type",         "R2H-FCC-Status",
+    "R2H-Upstream-Protocol",      "R2H-Upstream-Transport", "R2H-Upstream-Payload",
+    "R2H-RTSP-Server",            "R2H-RTSP-Describe-Range", "R2H-RTSP-Timeshift-Status",
+    "R2H-Playback-Scale",         "R2H-Playback-Range",      "R2H-Media-Duration",
+    "R2H-FCC-Type",               "R2H-FCC-Status",
 };
 
 /* Enum value -> header value.  A NULL entry means "not known", which omits the
@@ -52,6 +58,7 @@ static const char *const stream_metadata_header_names[STREAM_HDR_COUNT] = {
 static const char *const stream_upstream_protocol_values[] = {NULL, "rtsp", "multicast"};
 static const char *const stream_upstream_transport_values[] = {NULL, "tcp-interleaved", "udp"};
 static const char *const stream_upstream_payload_values[] = {NULL, "mp2t-rtp", "mp2t-direct"};
+static const char *const stream_rtsp_range_unit_values[] = {NULL, "npt", "clock", "smpte"};
 static const char *const stream_fcc_type_values[] = {NULL, "telecom", "huawei"};
 static const char *const stream_fcc_status_values[] = {NULL, "active", "fallback"};
 
@@ -172,6 +179,10 @@ void stream_metadata_forget(stream_metadata_t *metadata, unsigned stages) {
   if (stages & STREAM_METADATA_STAGE_DESCRIBE) {
     metadata->upstream_payload = STREAM_PAYLOAD_UNKNOWN;
     metadata->media_duration_known = 0;
+    metadata->rtsp_server[0] = '\0';
+    metadata->rtsp_describe_range_unit = STREAM_RTSP_RANGE_UNKNOWN;
+    metadata->rtsp_timeshift_status = 0;
+    metadata->rtsp_timeshift_status_known = 0;
   }
   if (stages & STREAM_METADATA_STAGE_SETUP)
     metadata->upstream_transport = STREAM_TRANSPORT_UNKNOWN;
@@ -200,7 +211,7 @@ static void stream_metadata_note_media(stream_context_t *ctx, int packet_type, c
   }
 }
 
-void stream_send_http_headers(connection_t *conn, const char *content_type, const char *extra_headers) {
+int stream_send_http_headers(connection_t *conn, const char *content_type, const char *extra_headers) {
   stream_metadata_t *metadata;
   char headers[STREAM_METADATA_HEADERS_SIZE];
   char number[64];
@@ -208,7 +219,7 @@ void stream_send_http_headers(connection_t *conn, const char *content_type, cons
   int failed = 0;
 
   if (!conn) {
-    return;
+    return -1;
   }
 
   metadata = &conn->stream.metadata;
@@ -226,6 +237,18 @@ void stream_send_http_headers(connection_t *conn, const char *content_type, cons
   failed |= stream_metadata_append_enum(headers, sizeof(headers), &length, STREAM_HDR_UPSTREAM_PAYLOAD,
                                         stream_upstream_payload_values, ARRAY_SIZE(stream_upstream_payload_values),
                                         metadata->upstream_payload) < 0;
+  if (metadata->rtsp_server[0])
+    failed |= stream_metadata_append_header(headers, sizeof(headers), &length,
+                                            stream_metadata_header_names[STREAM_HDR_RTSP_SERVER],
+                                            metadata->rtsp_server) < 0;
+  failed |= stream_metadata_append_enum(headers, sizeof(headers), &length, STREAM_HDR_RTSP_DESCRIBE_RANGE_UNIT,
+                                        stream_rtsp_range_unit_values, ARRAY_SIZE(stream_rtsp_range_unit_values),
+                                        metadata->rtsp_describe_range_unit) < 0;
+  if (metadata->rtsp_timeshift_status_known) {
+    snprintf(number, sizeof(number), "%d", metadata->rtsp_timeshift_status);
+    failed |= stream_metadata_append_header(headers, sizeof(headers), &length,
+                                            stream_metadata_header_names[STREAM_HDR_RTSP_TIMESHIFT_STATUS], number) < 0;
+  }
 
   /* A value we cannot render exactly is dropped rather than approximated. */
   if (metadata->playback_scale_known && isfinite(metadata->playback_scale)) {
@@ -258,13 +281,16 @@ void stream_send_http_headers(connection_t *conn, const char *content_type, cons
     failed |= stream_metadata_append_expose_headers(headers, sizeof(headers), &length) < 0;
   }
 
+  int result;
   if (failed) {
     logger(LOG_ERROR, "Failed to build stream metadata HTTP headers");
-    send_http_headers(conn, STATUS_200, content_type, extra_headers);
+    result = send_http_headers(conn, STATUS_200, content_type, extra_headers);
   } else {
-    send_http_headers(conn, STATUS_200, content_type, headers);
+    result = send_http_headers(conn, STATUS_200, content_type, headers);
   }
-  metadata->frozen = 1;
+  if (result == 0)
+    metadata->frozen = 1;
+  return result;
 }
 
 void stream_on_client_drain(stream_context_t *ctx) {
@@ -367,6 +393,8 @@ int stream_handle_fd_event(stream_context_t *ctx, int fd, uint32_t events, int64
   if (ctx->rtsp.initialized && ctx->rtsp.socket >= 0 && fd == ctx->rtsp.socket) {
     /* Handle RTSP socket events (handshake and RTP data in PLAYING state) */
     int result = rtsp_handle_socket_event(&ctx->rtsp, events);
+    if (result == STREAM_EVENT_UNSUPPORTED_MEDIA)
+      return STREAM_EVENT_UNSUPPORTED_MEDIA;
     if (result < 0) {
       if (result == STREAM_EVENT_DURATION_READY) {
         logger(LOG_DEBUG, "RTSP: found duration: %0.3f", ctx->rtsp.r2h_duration_value);
@@ -383,6 +411,8 @@ int stream_handle_fd_event(stream_context_t *ctx, int fd, uint32_t events, int64
   /* Process RTSP RTP socket events (UDP mode) */
   if (ctx->rtsp.initialized && ctx->rtsp.rtp_socket >= 0 && fd == ctx->rtsp.rtp_socket) {
     int result = rtsp_handle_udp_rtp_data(&ctx->rtsp, ctx->conn);
+    if (result == STREAM_EVENT_UNSUPPORTED_MEDIA)
+      return STREAM_EVENT_UNSUPPORTED_MEDIA;
     if (result < 0) {
       return -1; /* Error */
     }
@@ -424,6 +454,17 @@ static int stream_init_rtsp_control(stream_context_t *ctx, service_t *service, i
   ctx->rtsp.conn = ctx->conn;
   ctx->rtsp.metadata_probe = metadata_probe;
   ctx->rtsp.upstream_ifname = get_upstream_interface_for_rtsp(service->ifname);
+  if (service->refplayer_source_id[0])
+    snprintf(ctx->rtsp.refplayer_source_id, sizeof(ctx->rtsp.refplayer_source_id), "%s",
+             service->refplayer_source_id);
+  if (service->refplayer_archive_request) {
+    ctx->rtsp.refplayer_archive_request = 1;
+    ctx->rtsp.refplayer_range_kind = service->refplayer_range_kind;
+    ctx->rtsp.refplayer_npt_target = service->refplayer_npt_target;
+    ctx->rtsp.refplayer_clock_target = service->refplayer_clock_target;
+    snprintf(ctx->rtsp.refplayer_observation_id, sizeof(ctx->rtsp.refplayer_observation_id), "%s",
+             service->refplayer_observation_id);
+  }
 
   if (!service->rtsp_url) {
     logger(LOG_ERROR, "RTSP URL not found in service configuration");
@@ -452,6 +493,15 @@ static int stream_init_rtsp_control(stream_context_t *ctx, service_t *service, i
   if (rtsp_parse_server_url(&ctx->rtsp, resolved_rtsp_url, NULL, NULL) < 0) {
     logger(LOG_ERROR, "RTSP: Failed to parse URL");
     return -1;
+  }
+  if (ctx->rtsp.refplayer_timeshift_enabled && !metadata_probe) {
+    if (ctx->rtsp.refplayer_source_id[0] && !ctx->rtsp.refplayer_archive_request &&
+        refplayer_rtsp_timeshift_session_id(ctx->rtsp.refplayer_session_id) != 0) {
+      /* Playback remains available; only source capability publication is
+       * suppressed if the process cannot obtain a non-reusable session ID. */
+      ctx->rtsp.refplayer_source_id[0] = '\0';
+      logger(LOG_WARN, "RTSP: Could not create RefPlayer capability session identity");
+    }
   }
   if (rtsp_connect(&ctx->rtsp) < 0) {
     logger(LOG_ERROR, "RTSP: Failed to initiate connection");

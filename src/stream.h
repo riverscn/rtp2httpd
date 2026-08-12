@@ -19,12 +19,14 @@
 #define SNAPSHOT_TIMEOUT_SEC 2
 
 #define STREAM_PLAYBACK_RANGE_SIZE 256
+#define STREAM_RTSP_SERVER_SIZE 128
 
 /* Return values of stream_handle_fd_event() / rtsp_handle_socket_event(). */
 #define STREAM_EVENT_OK 0
 #define STREAM_EVENT_CLOSE (-1)
 #define STREAM_EVENT_DURATION_READY (-2)
 #define STREAM_EVENT_METADATA_READY (-3)
+#define STREAM_EVENT_UNSUPPORTED_MEDIA (-4)
 
 /* RTSP handshake stages a metadata field can be learned from.  Used to forget
  * the right subset when a stage is retried (auth) or replayed against another
@@ -53,6 +55,13 @@ typedef enum {
   STREAM_PAYLOAD_MP2T_DIRECT
 } stream_upstream_payload_t;
 
+typedef enum {
+  STREAM_RTSP_RANGE_UNKNOWN = 0,
+  STREAM_RTSP_RANGE_NPT,
+  STREAM_RTSP_RANGE_CLOCK,
+  STREAM_RTSP_RANGE_SMPTE
+} stream_rtsp_range_unit_t;
+
 typedef enum { STREAM_FCC_TYPE_UNKNOWN = 0, STREAM_FCC_TYPE_TELECOM, STREAM_FCC_TYPE_HUAWEI } stream_fcc_type_t;
 
 typedef enum {
@@ -77,8 +86,12 @@ typedef struct stream_metadata_s {
   double playback_scale;
   double media_duration;
   char playback_range[STREAM_PLAYBACK_RANGE_SIZE];
+  char rtsp_server[STREAM_RTSP_SERVER_SIZE];
+  stream_rtsp_range_unit_t rtsp_describe_range_unit;
+  int8_t rtsp_timeshift_status;
   uint8_t playback_scale_known;
   uint8_t media_duration_known;
+  uint8_t rtsp_timeshift_status_known;
   uint8_t frozen;
 } stream_metadata_t;
 
@@ -197,8 +210,9 @@ void stream_metadata_forget(stream_metadata_t *metadata, unsigned stages);
 /**
  * Send a successful HTTP response with any known stream metadata appended to
  * extra_headers.  extra_headers may be NULL.
+ * Returns 0 only after the complete header has been queued, otherwise -1.
  */
-void stream_send_http_headers(connection_t *conn, const char *content_type, const char *extra_headers);
+int stream_send_http_headers(connection_t *conn, const char *content_type, const char *extra_headers);
 
 /**
  * Notify that the client send queue has just been drained (some buffers

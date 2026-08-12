@@ -111,7 +111,7 @@ https://edge.example.test/news-low.m3u8$SD
     }
 
 
-def test_native_rtp_udp_rtsp_live_stay_direct_and_only_rtsp_catchup_uses_helper(r2h_binary):
+def test_native_rtp_udp_stay_direct_and_rtsp_becomes_helper_candidate(r2h_binary):
     base_url = "http://iptv.example.test/playlist.m3u"
     raw_live = """\
 #EXTM3U
@@ -169,13 +169,16 @@ rtsp://iptv.example.test/live
         _catalog_frame(base_url, raw_rtsp),
     )
     assert returncode == 0
-    assert payload["mode"] == "direct"
-    assert payload["reason"] is None
+    assert payload["mode"] == "mixed"
+    assert payload["reason"] == "live_source_rtsp_candidate"
     source = payload["channels"][0]["sources"][0]
     assert source["live_url"] == "rtsp://iptv.example.test/live"
-    assert source["live_route"] == "direct"
+    assert source["live_route"] == "rtsp_helper_candidate"
     assert source["catchup_route"] is None
-    assert payload["proxy_m3u"] is None
+    assert payload["proxy_m3u"] == (
+        '#EXTM3U\n#EXTINF:-1 refplayer-source-id="%s",refplayer-rtsp\n'
+        "rtsp://iptv.example.test/live\n" % source["id"]
+    )
 
     rtsp_append_catchup = """\
 #EXTM3U
@@ -189,12 +192,12 @@ rtsp://iptv.example.test/live
     )
     assert returncode == 0
     source = payload["channels"][0]["sources"][0]
-    assert source["live_route"] == "direct"
+    assert source["live_route"] == "rtsp_helper_candidate"
     assert source["catchup_route"] == "rtsp_helper_candidate"
     assert payload["proxy_m3u"] == (
         '#EXTM3U\n#EXTINF:-1 refplayer-source-id="%s" catchup="default" '
         'catchup-source="rtsp://iptv.example.test/live?playseek=${(b)timestamp}-${(e)timestamp}",refplayer-rtsp\n'
-        "rtsp://iptv.example.test/live?playseek=${(b)timestamp}-${(e)timestamp}\n" % source["id"]
+        "rtsp://iptv.example.test/live\n" % source["id"]
     )
     returncode, resolved = _run(
         r2h_binary,
@@ -269,10 +272,18 @@ https://media.example.test/live.m3u8
         source
         for channel in payload["channels"]
         for source in channel["sources"]
-        if source["catchup_route"] == "rtsp_helper_candidate"
+        if source["live_route"] == "rtsp_helper_candidate"
     ]
-    assert candidate_sources == []
-    assert payload["proxy_m3u"] is None
+    assert len(candidate_sources) == 1
+    proxy_m3u = payload["proxy_m3u"]
+    assert proxy_m3u == (
+        '#EXTM3U\n#EXTINF:-1 refplayer-source-id="%s",refplayer-rtsp\n'
+        "rtsp://iptv.example.test/live\n" % candidate_sources[0]["id"]
+    )
+    assert "Injected" not in proxy_m3u
+    assert "attribute=" not in proxy_m3u
+    assert "live\\injected" not in proxy_m3u
+    assert 'live"injected' not in proxy_m3u
 
 
 def test_mixed_http_live_rtsp_catchup_snapshot_round_trips_source_id(r2h_binary):
@@ -303,7 +314,9 @@ maxclients = 10
 
 [services]
 {direct["proxy_m3u"]}"""
-    process = R2HProcess(r2h_binary, port, config_content=config)
+    env = os.environ.copy()
+    env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+    process = R2HProcess(r2h_binary, port, config_content=config, env=env)
     try:
         process.start()
         status, _, body = http_get("127.0.0.1", port, "/api/refplayer/v1/catalog")

@@ -33,6 +33,7 @@ endif()
 set(COMMON_SOURCES
   src/rtp2httpd.c
   src/refplayer_direct.c
+  src/refplayer_rtsp_timeshift.c
   src/supervisor.c
   src/pid_file.c
   src/configuration.c

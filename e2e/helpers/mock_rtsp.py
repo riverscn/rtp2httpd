@@ -29,11 +29,16 @@ class _RTSPServerBase:
         content_base: str | None = "auto",
         custom_sdp: str | None = None,
         options_session_id: str | None = None,
+        server_header: str | None = None,
+        timeshift_status: int | None = None,
         play_response_headers: list[tuple[str, str]] | None = None,
+        play_response_headers_sequence: list[list[tuple[str, str]]] | None = None,
         close_after_describe: bool = False,
         reset_after_describe: bool = False,
         redirect_describe_to: str | None = None,
         challenge_describe_once: bool = False,
+        play_status: int = 200,
+        play_response_delay: float = 0.0,
         host: str = "127.0.0.1",
     ):
         """
@@ -48,6 +53,8 @@ class _RTSPServerBase:
             options_session_id: If set, OPTIONS responds with this Session ID
                 and every subsequent request (DESCRIBE, SETUP, PLAY, ...)
                 must echo it (simulates HMS-style servers).
+            server_header: Optional RTSP ``Server`` response-header value.
+            timeshift_status: Optional zero/one ``Timeshift-Status`` value.
             play_response_headers: Extra headers to append to the PLAY 200 OK
                 (e.g. ``[("Scale", "2.0"), ("Range", "npt=0-30")]``).
             close_after_describe: Close the control connection immediately after
@@ -66,11 +73,19 @@ class _RTSPServerBase:
         self._content_base = content_base
         self._custom_sdp = custom_sdp
         self._options_session_id = options_session_id
+        self._server_header = server_header
+        if timeshift_status not in (None, 0, 1):
+            raise ValueError("timeshift_status must be zero, one, or None")
+        self._timeshift_status = timeshift_status
         self._play_response_headers = play_response_headers or []
+        self._play_response_headers_sequence = play_response_headers_sequence or []
+        self._play_response_count = 0
         self._close_after_describe = close_after_describe
         self._reset_after_describe = reset_after_describe
         self._redirect_describe_to = redirect_describe_to
         self._challenge_describe_once = challenge_describe_once
+        self._play_status = play_status
+        self._play_response_delay = play_response_delay
         self._describe_challenged = False
         self._server_sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -107,6 +122,9 @@ class _RTSPServerBase:
     def _after_play(self, conn: socket.socket, addr: tuple) -> None:
         """Called right after the PLAY 200 OK is sent.  Pump data here."""
         raise NotImplementedError
+
+    def _before_play(self, conn: socket.socket, addr: tuple) -> None:
+        """Optionally emit transport data before the PLAY response."""
 
     def _session_id(self) -> str:
         """Session ID returned by OPTIONS/SETUP/PLAY (HMS uses OPTIONS session)."""
@@ -166,6 +184,10 @@ class _RTSPServerBase:
                         "headers": req_headers_map,
                     }
                 )
+                server_line = f"Server: {self._server_header}\r\n" if self._server_header else ""
+                timeshift_line = (
+                    f"Timeshift-Status: {self._timeshift_status}\r\n" if self._timeshift_status is not None else ""
+                )
 
                 # HMS-style servers assign the session at OPTIONS time and
                 # close the connection if any later request doesn't echo it.
@@ -183,7 +205,7 @@ class _RTSPServerBase:
                     conn.sendall(
                         (
                             f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n"
-                            f"{session_line}"
+                            f"{server_line}{timeshift_line}{session_line}"
                             "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n"
                         ).encode()
                     )
@@ -232,7 +254,9 @@ class _RTSPServerBase:
                         cb_header = f"Content-Base: {self._content_base}\r\n"
                     conn.sendall(
                         (
-                            f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nContent-Type: application/sdp\r\n{cb_header}Content-Length: {len(sdp)}\r\n\r\n{sdp}"
+                            f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n"
+                            f"{server_line}{timeshift_line}"
+                            f"Content-Type: application/sdp\r\n{cb_header}Content-Length: {len(sdp)}\r\n\r\n{sdp}"
                         ).encode()
                     )
                     if self._reset_after_describe:
@@ -243,12 +267,29 @@ class _RTSPServerBase:
                 elif method == "SETUP":
                     conn.sendall(self._setup_response(cseq, transport_hdr).encode())
                 elif method == "PLAY":
-                    extra_headers = "".join("{}: {}\r\n".format(*item) for item in self._play_response_headers)
+                    self._before_play(conn, addr)
+                    if self._play_response_delay:
+                        time.sleep(self._play_response_delay)
+                    play_headers = self._play_response_headers
+                    if self._play_response_headers_sequence:
+                        sequence_index = min(self._play_response_count, len(self._play_response_headers_sequence) - 1)
+                        play_headers = self._play_response_headers_sequence[sequence_index]
+                    self._play_response_count += 1
+                    extra_headers = "".join("%s: %s\r\n" % item for item in play_headers)
                     conn.sendall(
                         (
-                            f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nSession: {self._session_id()}\r\n{extra_headers}\r\n"
+                            "RTSP/1.0 %d %s\r\nCSeq: %s\r\nSession: %s\r\n%s\r\n"
+                            % (
+                                self._play_status,
+                                "OK" if self._play_status == 200 else "Play Failed",
+                                cseq,
+                                self._session_id(),
+                                extra_headers,
+                            )
                         ).encode()
                     )
+                    if self._play_status != 200:
+                        return
                     self._after_play(conn, addr)
                     return
                 elif method == "TEARDOWN":
@@ -286,13 +327,22 @@ class MockRTSPServer(_RTSPServerBase):
         content_base: str | None = "auto",
         custom_sdp: str | None = None,
         options_session_id: str | None = None,
+        server_header: str | None = None,
+        timeshift_status: int | None = None,
         play_response_headers: list[tuple[str, str]] | None = None,
+        play_response_headers_sequence: list[list[tuple[str, str]]] | None = None,
         close_after_describe: bool = False,
         reset_after_describe: bool = False,
         redirect_describe_to: str | None = None,
         challenge_describe_once: bool = False,
         encapsulate_rtp: bool = True,
         setup_transport: str = "RTP/AVP/TCP;unicast;interleaved=0-1",
+        leading_payloads: list[bytes] | None = None,
+        media_payload: bytes | None = None,
+        media_payload_type: int = 33,
+        media_before_play_packets: int = 0,
+        play_status: int = 200,
+        play_response_delay: float = 0.0,
         host: str = "127.0.0.1",
     ):
         super().__init__(
@@ -301,32 +351,62 @@ class MockRTSPServer(_RTSPServerBase):
             content_base=content_base,
             custom_sdp=custom_sdp,
             options_session_id=options_session_id,
+            server_header=server_header,
+            timeshift_status=timeshift_status,
             play_response_headers=play_response_headers,
+            play_response_headers_sequence=play_response_headers_sequence,
             close_after_describe=close_after_describe,
             reset_after_describe=reset_after_describe,
             redirect_describe_to=redirect_describe_to,
             challenge_describe_once=challenge_describe_once,
+            play_status=play_status,
+            play_response_delay=play_response_delay,
             host=host,
         )
         self._num_packets = num_packets
         self._encapsulate_rtp = encapsulate_rtp
         self._setup_transport = setup_transport
+        self._leading_payloads = leading_payloads or []
+        self._media_payload = media_payload
+        self._media_payload_type = media_payload_type
+        self._media_before_play_packets = media_before_play_packets
 
     def _setup_response(self, cseq: str, transport_hdr: str) -> str:
         return f"RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\nTransport: {self._setup_transport}\r\nSession: {self._session_id()}\r\n\r\n"
 
     def _after_play(self, conn: socket.socket, addr: tuple) -> None:
+        self._send_media(conn, self._num_packets)
+
+    def _before_play(self, conn: socket.socket, addr: tuple) -> None:
+        self._send_media(conn, self._media_before_play_packets)
+
+    def _send_media(self, conn: socket.socket, count: int) -> None:
         seq = 0
         ts = 0
         try:
-            for _ in range(self._num_packets):
+            for media_payload in self._leading_payloads:
+                payload = (
+                    make_rtp_packet(seq, ts, payload_type=self._media_payload_type, payload=media_payload)
+                    if self._encapsulate_rtp
+                    else media_payload
+                )
+                frame = b"\x24" + struct.pack("!BH", 0, len(payload)) + payload
+                conn.sendall(frame)
+                seq = (seq + 1) & 0xFFFF
+                ts = (ts + 3600) & 0xFFFFFFFF
+            for _ in range(count):
                 if self._stop.is_set():
                     break
                 if self._encapsulate_rtp:
-                    payload = make_rtp_packet(seq, ts)
+                    payload = make_rtp_packet(
+                        seq,
+                        ts,
+                        payload_type=self._media_payload_type,
+                        payload=self._media_payload,
+                    )
                 else:
                     # Bare MPEG-TS, one 1316-byte chunk (7 x 188) per frame.
-                    payload = TS_NULL_PACKET * 7
+                    payload = self._media_payload if self._media_payload is not None else TS_NULL_PACKET * 7
                 frame = b"\x24" + struct.pack("!BH", 0, len(payload)) + payload
                 conn.sendall(frame)
                 seq = (seq + 1) & 0xFFFF
@@ -348,9 +428,29 @@ class MockRTSPServerUDP(_RTSPServerBase):
     Sends a fixed burst then closes (same rationale as the TCP variant).
     """
 
-    def __init__(self, port: int = 0, num_packets: int = 200):
-        super().__init__(port)
+    def __init__(
+        self,
+        port: int = 0,
+        num_packets: int = 200,
+        media_before_play_packets: int = 0,
+        play_status: int = 200,
+        play_response_delay: float = 0.0,
+        play_response_headers: list[tuple[str, str]] | None = None,
+        custom_sdp: str | None = None,
+        server_header: str | None = None,
+        timeshift_status: int | None = None,
+    ):
+        super().__init__(
+            port,
+            custom_sdp=custom_sdp,
+            server_header=server_header,
+            timeshift_status=timeshift_status,
+            play_response_headers=play_response_headers,
+            play_status=play_status,
+            play_response_delay=play_response_delay,
+        )
         self._num_packets = num_packets
+        self._media_before_play_packets = media_before_play_packets
         self._server_rtp_port = 0
         self._server_rtcp_port = 0
         self._client_rtp_port = 0
@@ -369,6 +469,12 @@ class MockRTSPServerUDP(_RTSPServerBase):
 
     def _after_play(self, conn: socket.socket, addr: tuple) -> None:
         """Send RTP packets over UDP to the client's advertised port."""
+        self._send_udp(addr, self._num_packets)
+
+    def _before_play(self, conn: socket.socket, addr: tuple) -> None:
+        self._send_udp(addr, self._media_before_play_packets)
+
+    def _send_udp(self, addr: tuple, count: int) -> None:
         client_ip = addr[0]
         udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -379,7 +485,7 @@ class MockRTSPServerUDP(_RTSPServerBase):
         seq = 0
         ts = 0
         try:
-            for _ in range(self._num_packets):
+            for _ in range(count):
                 if self._stop.is_set():
                     break
                 rtp = make_rtp_packet(seq, ts)

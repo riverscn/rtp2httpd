@@ -30,6 +30,7 @@ class R2HProcess:
         capture_log: bool = False,
         listen: str | None = None,
         wait_socket_path: str | None = None,
+        env: dict[str, str] | None = None,
     ):
         self.binary = str(binary)
         self.port = port
@@ -38,6 +39,7 @@ class R2HProcess:
         self.capture_log = capture_log
         self.listen = listen
         self.wait_socket_path = wait_socket_path
+        self.env = env
         self.process: subprocess.Popen | None = None
         self._config_path: str | None = None
         self._log_path: str | None = None
@@ -50,9 +52,9 @@ class R2HProcess:
         if self.capture_log:
             log_fd, self._log_path = tempfile.mkstemp(suffix=".log", prefix="r2h_log_")
             self._log_handle = os.fdopen(log_fd, "w")
-            self.process = subprocess.Popen(args, stdout=self._log_handle, stderr=self._log_handle)
+            self.process = subprocess.Popen(args, stdout=self._log_handle, stderr=self._log_handle, env=self.env)
         else:
-            self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=self.env)
         if wait:
             if self.wait_socket_path:
                 if not wait_for_unix_socket(self.wait_socket_path, timeout=6.0):

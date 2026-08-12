@@ -87,7 +87,8 @@ int rtp_get_payload(uint8_t *buf, int recv_len, uint8_t **payload, int *size, ui
 int rtp_queue_buf_direct(connection_t *conn, buffer_ref_t *buf_ref) {
   /* Send headers lazily on first data packet */
   if (!conn->headers_sent) {
-    stream_send_http_headers(conn, "video/mp2t", NULL);
+    if (stream_send_http_headers(conn, "video/mp2t", NULL) < 0)
+      return -1;
   }
 
   /* Queue for zero-copy send */

@@ -952,6 +952,11 @@ static int direct_add_source(direct_catalog_t *catalog, direct_channel_t *channe
   live_kind = direct_resolve_url(raw_live_url, base_url, &live_url);
   if (live_kind == DIRECT_URL_INVALID)
     return 0;
+  if (live_kind == DIRECT_URL_RTSP_CANDIDATE) {
+    catalog->has_rtsp_candidates = 1;
+    if (!catalog->rtsp_candidate_reason)
+      catalog->rtsp_candidate_reason = "live_source_rtsp_candidate";
+  }
   if (has_declared_catchup) {
     if (direct_is_rtsp_url(extinf->catchup_source)) {
       if (direct_validate_absolute_rtsp_url(extinf->catchup_source) == 0) {
@@ -1246,7 +1251,7 @@ static int direct_catalog_json(const direct_catalog_t *catalog, direct_json_t *j
       DIRECT_APPEND(",\"live_url\":\"");
       DIRECT_ESCAPE(source->live_url);
       DIRECT_APPEND("\",\"live_route\":\"");
-      DIRECT_APPEND("direct");
+      DIRECT_APPEND(source->live_kind == DIRECT_URL_RTSP_CANDIDATE ? "rtsp_helper_candidate" : "direct");
       DIRECT_APPEND("\",\"catchup_route\":");
       if (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE) {
         DIRECT_APPEND("\"rtsp_helper_candidate\"");
@@ -1316,7 +1321,7 @@ static int direct_json_append_proxy_m3u(direct_json_t *json, const direct_catalo
 
   for (const direct_channel_t *channel = catalog->channels; channel; channel = channel->next)
     for (const direct_source_t *source = channel->sources; source; source = source->next)
-      if (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE)
+      if (source->live_kind == DIRECT_URL_RTSP_CANDIDATE || source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE)
         has_candidate = 1;
   if (!has_candidate)
     return direct_json_append(json, "null");
@@ -1326,9 +1331,9 @@ static int direct_json_append_proxy_m3u(direct_json_t *json, const direct_catalo
   for (const direct_channel_t *channel = catalog->channels; channel; channel = channel->next) {
     for (const direct_source_t *source = channel->sources; source; source = source->next) {
       const char *proxy_live_url;
-      if (source->catchup_kind != DIRECT_URL_RTSP_CANDIDATE)
+      if (source->live_kind != DIRECT_URL_RTSP_CANDIDATE && source->catchup_kind != DIRECT_URL_RTSP_CANDIDATE)
         continue;
-      proxy_live_url = source->catchup_template;
+      proxy_live_url = source->live_kind == DIRECT_URL_RTSP_CANDIDATE ? source->live_url : source->catchup_template;
       if (!proxy_live_url || direct_validate_absolute_rtsp_url(proxy_live_url) != 0 ||
           (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE &&
            (!source->catchup_template || direct_validate_absolute_rtsp_url(source->catchup_template) != 0)) ||

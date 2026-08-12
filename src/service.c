@@ -1636,6 +1636,25 @@ cleanup:
   return result;
 }
 
+service_t *service_create_refplayer_rtsp_archive(service_t *configured_service, const char *source_id,
+                                                 const char *observation_id, service_refplayer_range_kind_t kind,
+                                                 double npt_target, int64_t clock_target) {
+  service_t *result;
+  if (!configured_service || configured_service->service_type != SERVICE_RTSP || !source_id || !observation_id ||
+      (kind != SERVICE_REFPLAYER_RANGE_NPT && kind != SERVICE_REFPLAYER_RANGE_CLOCK))
+    return NULL;
+  result = service_clone(configured_service);
+  if (!result)
+    return NULL;
+  snprintf(result->refplayer_source_id, sizeof(result->refplayer_source_id), "%s", source_id);
+  snprintf(result->refplayer_observation_id, sizeof(result->refplayer_observation_id), "%s", observation_id);
+  result->refplayer_range_kind = kind;
+  result->refplayer_npt_target = npt_target;
+  result->refplayer_clock_target = clock_target;
+  result->refplayer_archive_request = 1;
+  return result;
+}
+
 service_t *service_create_from_rtp_url(const char *http_url) {
   service_t *result = NULL;
   char working_url[HTTP_URL_BUFFER_SIZE];
@@ -2033,6 +2052,13 @@ service_t *service_clone(service_t *service) {
   cloned->seek_mode_tz_explicit = service->seek_mode_tz_explicit;
   cloned->seek_mode_tz_offset_seconds = service->seek_mode_tz_offset_seconds;
   cloned->seek_mode_window_seconds = service->seek_mode_window_seconds;
+  memcpy(cloned->refplayer_source_id, service->refplayer_source_id, sizeof(cloned->refplayer_source_id));
+  memcpy(cloned->refplayer_observation_id, service->refplayer_observation_id,
+         sizeof(cloned->refplayer_observation_id));
+  cloned->refplayer_range_kind = service->refplayer_range_kind;
+  cloned->refplayer_npt_target = service->refplayer_npt_target;
+  cloned->refplayer_clock_target = service->refplayer_clock_target;
+  cloned->refplayer_archive_request = service->refplayer_archive_request;
 
   if (service->user_agent) {
     cloned->user_agent = strdup(service->user_agent);

@@ -31,7 +31,9 @@ typedef enum {
   STATUS_500 = 5,
   STATUS_401 = 6,
   STATUS_304 = 7,
-  STATUS_204 = 8
+  STATUS_204 = 8,
+  STATUS_405 = 9,
+  STATUS_416 = 10
 } http_status_t;
 
 /* HTTP request parsing state */
@@ -96,8 +98,9 @@ int http_parse_request(char *inbuf, int *in_len, http_request_t *req);
  * charset=utf-8", "application/json", or NULL to skip)
  * @param extra_headers Optional extra headers to include (NULL or empty string
  * if none) Should NOT include trailing CRLF as it will be added automatically
+ * @return 0 only when the complete header was queued, -1 on queue failure
  */
-void send_http_headers(connection_t *c, http_status_t status, const char *content_type, const char *extra_headers);
+int send_http_headers(connection_t *c, http_status_t status, const char *content_type, const char *extra_headers);
 
 /**
  * Decode percent-encoded sequences in-place within a URL component
@@ -151,6 +154,12 @@ int http_parse_query_param(const char *query_string, const char *param_name, cha
  */
 int http_filter_query_param(const char *query_string, const char *exclude_param, char *output, size_t output_size);
 
+/* Remove helper authentication and all RefPlayer private control parameters.
+ * Parameter names are decoded before comparison so case/percent aliases
+ * cannot leak into logs or status views. */
+int http_filter_private_query(const char *query_string, char *output, size_t output_size);
+int http_redact_private_url(const char *url, char *output, size_t output_size);
+
 /**
  * Find $label suffix at the end of a URL.
  * A $label is a trailing "$..." at the very end of the URL, used for UI display
@@ -202,6 +211,9 @@ void http_send_400(connection_t *conn);
  * @param conn Connection object
  */
 void http_send_404(connection_t *conn);
+
+/** Send HTTP 416 Range Not Satisfiable response. */
+void http_send_416(connection_t *conn);
 
 /**
  * Send HTTP 500 Internal Server Error response

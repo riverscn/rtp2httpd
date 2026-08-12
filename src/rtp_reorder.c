@@ -83,7 +83,8 @@ static int deliver_raw_packet(uint8_t *data, int len, connection_t *conn, int is
   }
   /* Send headers lazily on first data packet (same as rtp_queue_buf_direct) */
   if (!conn->headers_sent) {
-    stream_send_http_headers(conn, "video/mp2t", NULL);
+    if (stream_send_http_headers(conn, "video/mp2t", NULL) < 0)
+      return -1;
   }
   return connection_queue_output(conn, data, len) == 0 ? len : -1;
 }
@@ -120,6 +121,8 @@ static int flush_consecutive(rtp_reorder_t *r, connection_t *conn, int is_snapsh
     r->base_seq++;
     r->count--;
     flushed++;
+    if (bytes < 0)
+      return -1;
   }
 
   if (log_recovery && flushed > 1) {
@@ -154,6 +157,8 @@ static int force_flush_until(rtp_reorder_t *r, uint16_t target_seq, connection_t
       buffer_ref_put(buf);
       r->slots[slot] = NULL;
       r->count--;
+      if (bytes < 0)
+        return -1;
     } else {
       lost_count++;
     }
@@ -215,7 +220,7 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn, c
 
       /* Flush consecutive from base_seq (already the minimum)
        * Don't log "Recovered" - this is normal init, not reordering */
-      total_bytes += flush_consecutive(r, conn, is_snapshot, 0, fec);
+      total_bytes = flush_consecutive(r, conn, is_snapshot, 0, fec);
     }
     return total_bytes;
   }
@@ -246,7 +251,10 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn, c
 
   /* Case 3: Beyond window -> force flush */
   if (seq_diff >= r->window_size) {
-    total_bytes += force_flush_until(r, seqn, conn, is_snapshot, fec);
+    int flushed_bytes = force_flush_until(r, seqn, conn, is_snapshot, fec);
+    if (flushed_bytes < 0)
+      return -1;
+    total_bytes += flushed_bytes;
   }
 
   /* Store in slot */
@@ -283,13 +291,18 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn, c
       if (bytes > 0)
         total_bytes += bytes;
       free(recovered_data);
+      if (bytes < 0)
+        return -1;
 
       /* Advance base_seq past the recovered packet */
       r->base_seq++;
 
       /* Flush consecutive packets (including the just-stored packet if now
        * consecutive) */
-      total_bytes += flush_consecutive(r, conn, is_snapshot, 0, fec);
+      int flushed_bytes = flush_consecutive(r, conn, is_snapshot, 0, fec);
+      if (flushed_bytes < 0)
+        return -1;
+      total_bytes += flushed_bytes;
     }
   }
 

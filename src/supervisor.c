@@ -5,6 +5,7 @@
 #include "m3u.h"
 #include "pid_file.h"
 #include "platform_compat.h"
+#include "refplayer_rtsp_timeshift.h"
 #include "rtp2httpd.h"
 #include "service.h"
 #include "status.h"
@@ -782,6 +783,7 @@ int run_worker(void) {
   access_log_cleanup();
   zerocopy_cleanup();
   status_cleanup();
+  refplayer_rtsp_timeshift_clear();
   config_cleanup(true);
 
   return result;

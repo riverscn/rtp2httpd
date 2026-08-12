@@ -140,6 +140,7 @@ char *m3u_generate_refplayer_catalog(const char *host_header, const char *x_forw
 
 /* Resolve opaque source IDs used by the RefPlayer catalog. */
 const m3u_catalog_channel_t *m3u_catalog_find_source(const char *source_id);
+const m3u_catalog_channel_t *m3u_catalog_find_live_service(const char *service_name);
 /* True once the configured external M3U has completed its first successful
  * parse, or immediately when no external M3U is configured. */
 int m3u_refplayer_is_ready(void);

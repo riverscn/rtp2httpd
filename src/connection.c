@@ -6,10 +6,12 @@
 #include "m3u.h"
 #include "platform_compat.h"
 #include "poller.h"
+#include "refplayer_rtsp_timeshift.h"
 #include "service.h"
 #include "status.h"
 #include "utils.h"
 #include "zerocopy.h"
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -45,6 +47,115 @@ static void handle_playlist_request(connection_t *c);
 static void handle_epg_request(connection_t *c, int requested_gz);
 static void handle_refplayer_catalog_request(connection_t *c);
 static void handle_refplayer_ready_request(connection_t *c);
+static void handle_refplayer_rtsp_timeshift_request(connection_t *c, const char *query);
+static void handle_refplayer_rtsp_timeshift_resolve_request(connection_t *c, const char *query);
+
+typedef struct {
+  const char *name;
+  char *value;
+  size_t value_size;
+  int required;
+  int seen;
+} refplayer_query_field_t;
+
+static int refplayer_query_token_matches(const refplayer_query_field_t *field);
+
+/* Private API and archive controls deliberately do not inherit the daemon's
+ * case-insensitive, first-match query semantics. Names must be literal ASCII,
+ * unique and unencoded; values are copied raw for typed validation. */
+static int refplayer_parse_exact_query(const char *query, refplayer_query_field_t *fields, size_t field_count) {
+  const char *position = query;
+
+  if (!query || !fields)
+    return -1;
+  while (*position) {
+    const char *end = strchr(position, '&');
+    size_t segment_length = end ? (size_t)(end - position) : strlen(position);
+    const char *equals = memchr(position, '=', segment_length);
+    size_t name_length;
+    size_t value_length;
+    refplayer_query_field_t *matched = NULL;
+
+    if (!equals || equals == position || segment_length == 0)
+      return -1;
+    name_length = (size_t)(equals - position);
+    value_length = segment_length - name_length - 1;
+    for (size_t index = 0; index < name_length; index++)
+      if (position[index] == '%' || position[index] == '+')
+        return -1;
+    for (size_t index = 0; index < field_count; index++)
+      if (strlen(fields[index].name) == name_length && strncmp(fields[index].name, position, name_length) == 0) {
+        matched = &fields[index];
+        break;
+      }
+    if (!matched || matched->seen || value_length >= matched->value_size)
+      return -1;
+    if (matched->value && matched->value_size) {
+      memcpy(matched->value, equals + 1, value_length);
+      matched->value[value_length] = '\0';
+    }
+    matched->seen = 1;
+    if (!end)
+      break;
+    position = end + 1;
+    if (!*position)
+      return -1;
+  }
+  for (size_t index = 0; index < field_count; index++)
+    if (fields[index].required && !fields[index].seen)
+      return -1;
+  return 0;
+}
+
+static int refplayer_query_mentions_rtsp_control(const char *query) {
+  const char *position = query;
+  static const char wanted[] = "r2h-refplayer-rtsp-";
+  if (!query)
+    return 0;
+  while (*position) {
+    const char *end = strchr(position, '&');
+    size_t segment_length = end ? (size_t)(end - position) : strlen(position);
+    const char *equals = memchr(position, '=', segment_length);
+    size_t name_length = equals ? (size_t)(equals - position) : segment_length;
+    char name[128];
+    if (name_length >= 19 && strncasecmp(position, "r2h-refplayer-rtsp-", 19) == 0)
+      return 1;
+    /* Decode just enough of an arbitrarily long name to recognize the
+     * reserved prefix. This closes the oversized percent-encoded alias path
+     * without allocating or accepting any alternate spelling. */
+    size_t raw_index = 0;
+    size_t decoded_index = 0;
+    int prefix_matches = 1;
+    while (raw_index < name_length && decoded_index < sizeof(wanted) - 1) {
+      unsigned char decoded;
+      if (position[raw_index] == '%' && raw_index + 2 < name_length &&
+          isxdigit((unsigned char)position[raw_index + 1]) &&
+          isxdigit((unsigned char)position[raw_index + 2])) {
+        char hex[3] = {position[raw_index + 1], position[raw_index + 2], '\0'};
+        decoded = (unsigned char)strtoul(hex, NULL, 16);
+        raw_index += 3;
+      } else {
+        decoded = (unsigned char)position[raw_index++];
+      }
+      if (tolower(decoded) != (unsigned char)wanted[decoded_index++]) {
+        prefix_matches = 0;
+        break;
+      }
+    }
+    if (prefix_matches && decoded_index == sizeof(wanted) - 1)
+      return 1;
+    if (name_length > 0 && name_length < sizeof(name)) {
+      memcpy(name, position, name_length);
+      name[name_length] = '\0';
+      if (http_url_decode(name) == 0 && strncasecmp(name, "r2h-refplayer-rtsp-", 19) == 0)
+        return 1;
+    }
+    if (!end)
+      break;
+    position = end + 1;
+  }
+  return 0;
+}
 
 static int refplayer_epoch_is_valid(const char *value, unsigned long long *parsed_value) {
   char *end = NULL;
@@ -816,6 +927,7 @@ int connection_route_and_start(connection_t *c) {
   /* Copy URL and strip $label suffix (UI display tag at URL end) */
   char url_buf[HTTP_URL_BUFFER_SIZE];
   char internal_url_buf[HTTP_URL_BUFFER_SIZE];
+  char redacted_url_buf[HTTP_URL_BUFFER_SIZE];
   strncpy(url_buf, c->http_req.url, sizeof(url_buf) - 1);
   url_buf[sizeof(url_buf) - 1] = '\0';
   http_strip_url_label(url_buf);
@@ -842,7 +954,10 @@ int connection_route_and_start(connection_t *c) {
     }
   }
 
-  logger(LOG_INFO, "New client %s requested URL: %s (method: %s)", client_addr_str, url, c->http_req.method);
+  if (http_redact_private_url(url, redacted_url_buf, sizeof(redacted_url_buf)) < 0)
+    snprintf(redacted_url_buf, sizeof(redacted_url_buf), "<invalid-or-private-url>");
+  logger(LOG_INFO, "New client %s requested URL: %s (method: %s)", client_addr_str, redacted_url_buf,
+         c->http_req.method);
 
   if (url[0] != '/') {
     http_send_400(c);
@@ -896,6 +1011,12 @@ int connection_route_and_start(connection_t *c) {
   url = internal_url_buf;
 
   /* Handle CORS preflight (OPTIONS) before r2h-token check */
+  const char *early_query = strchr(url, '?');
+  if (early_query && refplayer_query_mentions_rtsp_control(early_query + 1) &&
+      strcmp(c->http_req.method, "GET") != 0) {
+    http_send_400(c);
+    return 0;
+  }
   if (config.cors_allow_origin && config.cors_allow_origin[0] && strcasecmp(c->http_req.method, "OPTIONS") == 0) {
     char cors_headers[1024];
     int clen = 0;
@@ -993,6 +1114,8 @@ int connection_route_and_start(connection_t *c) {
   const char *refplayer_catalog_route = "api/refplayer/v1/catalog";
   const char *refplayer_ready_route = "api/refplayer/v1/ready";
   const char *refplayer_reload_route = "api/refplayer/v1/reload";
+  const char *refplayer_rtsp_timeshift_route = "api/refplayer/v1/rtsp-timeshift";
+  const char *refplayer_rtsp_timeshift_resolve_route = "api/refplayer/v1/rtsp-timeshift/resolve";
   if (strlen(refplayer_catalog_route) == path_len &&
       strncmp(service_path, refplayer_catalog_route, path_len) == 0) {
     handle_refplayer_catalog_request(c);
@@ -1004,6 +1127,16 @@ int connection_route_and_start(connection_t *c) {
   }
   if (strlen(refplayer_reload_route) == path_len && strncmp(service_path, refplayer_reload_route, path_len) == 0) {
     handle_reload_config(c);
+    return 0;
+  }
+  if (strlen(refplayer_rtsp_timeshift_resolve_route) == path_len &&
+      strncmp(service_path, refplayer_rtsp_timeshift_resolve_route, path_len) == 0) {
+    handle_refplayer_rtsp_timeshift_resolve_request(c, query_start ? query_start + 1 : NULL);
+    return 0;
+  }
+  if (strlen(refplayer_rtsp_timeshift_route) == path_len &&
+      strncmp(service_path, refplayer_rtsp_timeshift_route, path_len) == 0) {
+    handle_refplayer_rtsp_timeshift_request(c, query_start ? query_start + 1 : NULL);
     return 0;
   }
 
@@ -1092,6 +1225,10 @@ int connection_route_and_start(connection_t *c) {
 
   /* Dynamic parsing for RTSP and UDPxy if needed */
   if (service == NULL) {
+    if (query_start && refplayer_query_mentions_rtsp_control(query_start + 1)) {
+      http_send_400(c);
+      return 0;
+    }
     if (config.udpxy) {
       service = service_create_from_udpxy_url(internal_url_buf);
     }
@@ -1109,15 +1246,68 @@ int connection_route_and_start(connection_t *c) {
     int has_source = 0;
     int has_start = 0;
     int has_end = 0;
+    int has_rtsp_archive = query_start && refplayer_query_mentions_rtsp_control(query_start + 1);
 
-    if (query_start) {
+    if (query_start && !has_rtsp_archive) {
       has_source = http_parse_query_param(query_start + 1, "r2h-refplayer-source", source_id, sizeof(source_id)) == 0;
       has_start =
           http_parse_query_param(query_start + 1, "r2h-refplayer-start", start_epoch, sizeof(start_epoch)) == 0;
       has_end = http_parse_query_param(query_start + 1, "r2h-refplayer-end", end_epoch, sizeof(end_epoch)) == 0;
     }
 
-    if (has_source || has_start || has_end) {
+    if (has_rtsp_archive) {
+      char token[256];
+      char archive_source[M3U_CATALOG_ID_SIZE];
+      char observation_id[REFPLAYER_RTSP_OBSERVATION_ID_SIZE];
+      char kind[16];
+      char target[64];
+      double npt_target = 0;
+      int64_t clock_target = 0;
+      refplayer_rtsp_observation_t observation;
+      const m3u_catalog_channel_t *catalog_source = m3u_catalog_find_live_service(decoded_path);
+      refplayer_query_field_t fields[] = {
+          {"r2h-token", token, sizeof(token), 1, 0},
+          {"r2h-refplayer-rtsp-source", archive_source, sizeof(archive_source), 1, 0},
+          {"r2h-refplayer-rtsp-observation", observation_id, sizeof(observation_id), 1, 0},
+          {"r2h-refplayer-rtsp-kind", kind, sizeof(kind), 1, 0},
+          {"r2h-refplayer-rtsp-target", target, sizeof(target), 1, 0},
+      };
+
+      if (strcmp(c->http_req.method, "GET") != 0 || !refplayer_rtsp_timeshift_enabled() ||
+          service->service_type != SERVICE_RTSP ||
+          refplayer_parse_exact_query(query_start + 1, fields, sizeof(fields) / sizeof(fields[0])) != 0 ||
+          !refplayer_query_token_matches(&fields[0]) || refplayer_rtsp_parse_source_id(archive_source) != 0 ||
+          refplayer_rtsp_parse_observation_id(observation_id) != 0 || !catalog_source ||
+          strcmp(catalog_source->id, archive_source) != 0) {
+        logger(LOG_WARN, "Rejected malformed or stale private RTSP archive request");
+        http_send_400(c);
+        return 0;
+      }
+      if (refplayer_rtsp_timeshift_find(archive_source, observation_id, &observation) != 1) {
+        http_send_404(c);
+        return 0;
+      }
+      if (strcmp(kind, "npt") == 0) {
+        if (refplayer_rtsp_parse_npt_target(target, &npt_target) != 0 ||
+            !refplayer_rtsp_npt_target_is_valid(&observation, npt_target)) {
+          http_send_416(c);
+          return 0;
+        }
+        service = service_create_refplayer_rtsp_archive(service, archive_source, observation_id,
+                                                        SERVICE_REFPLAYER_RANGE_NPT, npt_target, 0);
+      } else if (strcmp(kind, "clock") == 0) {
+        if (refplayer_rtsp_parse_clock_target(target, &clock_target) != 0 ||
+            !refplayer_rtsp_clock_target_is_valid(&observation, clock_target)) {
+          http_send_416(c);
+          return 0;
+        }
+        service = service_create_refplayer_rtsp_archive(service, archive_source, observation_id,
+                                                        SERVICE_REFPLAYER_RANGE_CLOCK, 0, clock_target);
+      } else {
+        http_send_400(c);
+        return 0;
+      }
+    } else if (has_source || has_start || has_end) {
       unsigned long long start_value;
       unsigned long long end_value;
       const m3u_catalog_channel_t *catalog_source;
@@ -1139,7 +1329,17 @@ int connection_route_and_start(connection_t *c) {
 
       service = service_create_refplayer_catchup(service, start_epoch, end_epoch, c->http_req.user_agent);
     } else {
-      service = service_create_with_query_merge(service, url, service->service_type);
+      char public_request_url[HTTP_URL_BUFFER_SIZE];
+      if (http_redact_private_url(url, public_request_url, sizeof(public_request_url)) < 0) {
+        http_send_400(c);
+        return 0;
+      }
+      service = service_create_with_query_merge(service, public_request_url, service->service_type);
+      if (service && service->service_type == SERVICE_RTSP && refplayer_rtsp_timeshift_enabled()) {
+        const m3u_catalog_channel_t *catalog_source = m3u_catalog_find_live_service(decoded_path);
+        if (catalog_source)
+          snprintf(service->refplayer_source_id, sizeof(service->refplayer_source_id), "%s", catalog_source->id);
+      }
     }
     if (!service) {
       logger(LOG_ERROR, "Failed to merge query params for service");
@@ -1192,14 +1392,14 @@ int connection_route_and_start(connection_t *c) {
   if (config.video_snapshot) {
     if (c->http_req.x_request_snapshot) {
       is_snapshot_request = 2;
-      logger(LOG_INFO, "Snapshot request detected via X-Request-Snapshot header for URL: %s", c->http_req.url);
+      logger(LOG_INFO, "Snapshot request detected via X-Request-Snapshot header for URL: %s", redacted_url_buf);
     }
 
     if (!is_snapshot_request && c->http_req.accept[0] != '\0') {
       /* Check if Accept header contains "image/jpeg" */
       if (strstr(c->http_req.accept, "image/jpeg") != NULL) {
         is_snapshot_request = 2;
-        logger(LOG_INFO, "Snapshot request detected via Accept header for URL: %s", c->http_req.url);
+        logger(LOG_INFO, "Snapshot request detected via Accept header for URL: %s", redacted_url_buf);
       }
     }
 
@@ -1209,7 +1409,7 @@ int connection_route_and_start(connection_t *c) {
       if (http_parse_query_param(query_start + 1, "snapshot", snapshot_value, sizeof(snapshot_value)) == 0) {
         if (strcmp(snapshot_value, "1") == 0) {
           is_snapshot_request = 1;
-          logger(LOG_INFO, "Snapshot request detected via query parameter for URL: %s", c->http_req.url);
+          logger(LOG_INFO, "Snapshot request detected via query parameter for URL: %s", redacted_url_buf);
         }
       }
     }
@@ -1232,10 +1432,10 @@ int connection_route_and_start(connection_t *c) {
       url_len += decoded_len;
     }
 
-    /* Add query parameters if present, excluding r2h-token */
+    /* Add only public query parameters to status/access reporting. */
     if (query_start && url_len < sizeof(display_url)) {
       char filtered_query[HTTP_URL_BUFFER_SIZE];
-      int filtered_len = http_filter_query_param(query_start + 1, "r2h-token", filtered_query, sizeof(filtered_query));
+      int filtered_len = http_filter_private_query(query_start + 1, filtered_query, sizeof(filtered_query));
       if (filtered_len > 0) {
         if (url_len + (size_t)filtered_len + 1 < sizeof(display_url)) {
           display_url[url_len++] = '?';
@@ -1382,6 +1582,179 @@ static void send_refplayer_json(connection_t *c, http_status_t status, const cha
   connection_queue_output_and_flush(c, body_len ? (const uint8_t *)body : NULL, body_len);
 }
 
+static service_t *refplayer_catalog_rtsp_service(const m3u_catalog_channel_t *channel) {
+  service_t *service;
+  if (!channel || !channel->service_name)
+    return NULL;
+  service = service_hashmap_get(channel->service_name);
+  return service && service->service_type == SERVICE_RTSP ? service : NULL;
+}
+
+static int refplayer_query_token_matches(const refplayer_query_field_t *field) {
+  return field && field->seen && config.r2h_token && strcmp(field->value, config.r2h_token) == 0;
+}
+
+static void handle_refplayer_rtsp_timeshift_request(connection_t *c, const char *query) {
+  char token[256];
+  char source_id[M3U_CATALOG_ID_SIZE];
+  char response[1024];
+  char start[64];
+  char end[64];
+  refplayer_rtsp_observation_t observation;
+  const m3u_catalog_channel_t *channel;
+  int result;
+  refplayer_query_field_t fields[] = {
+      {"r2h-token", token, sizeof(token), 1, 0},
+      {"source_id", source_id, sizeof(source_id), 1, 0},
+  };
+
+  if (!c)
+    return;
+  if (strcmp(c->http_req.method, "GET") != 0) {
+    send_refplayer_json(c, STATUS_405, "{\"schema_version\":2,\"error\":\"method_not_allowed\"}");
+    return;
+  }
+  if (refplayer_parse_exact_query(query, fields, sizeof(fields) / sizeof(fields[0])) != 0 ||
+      !refplayer_query_token_matches(&fields[0]) || refplayer_rtsp_parse_source_id(source_id) != 0) {
+    send_refplayer_json(c, STATUS_400, "{\"schema_version\":2,\"error\":\"invalid_query\"}");
+    return;
+  }
+  channel = m3u_catalog_find_source(source_id);
+  if (!channel || !refplayer_catalog_rtsp_service(channel)) {
+    send_refplayer_json(c, STATUS_404, "{\"schema_version\":2,\"error\":\"unknown_source\"}");
+    return;
+  }
+  result = refplayer_rtsp_timeshift_discover(source_id, &observation);
+  if (result == 0)
+    result = refplayer_rtsp_timeshift_latest(source_id, &observation);
+  if (result <= 0) {
+    snprintf(response, sizeof(response),
+             "{\"schema_version\":2,\"source_id\":\"%s\",\"capability\":null}", source_id);
+    send_refplayer_json(c, STATUS_200, response);
+    return;
+  }
+  if (observation.kind == REFPLAYER_RTSP_RANGE_NPT) {
+    if (refplayer_rtsp_format_npt(observation.npt_start, start, sizeof(start)) != 0 ||
+        refplayer_rtsp_format_npt(observation.npt_end, end, sizeof(end)) != 0) {
+      send_refplayer_json(c, STATUS_500, "{\"schema_version\":2,\"error\":\"internal_error\"}");
+      return;
+    }
+    snprintf(response, sizeof(response),
+             "{\"schema_version\":2,\"source_id\":\"%s\",\"capability\":{"
+             "\"observation_id\":\"%s\",\"observed_at_epoch\":%lld,\"expires_at_epoch\":%lld,"
+             "\"range\":{\"kind\":\"npt\",\"start_seconds\":%s,\"end_seconds\":%s}}}",
+             source_id, observation.observation_id, (long long)observation.observed_at_epoch,
+             (long long)observation.expires_at_epoch, start, end);
+  } else {
+    snprintf(response, sizeof(response),
+             "{\"schema_version\":2,\"source_id\":\"%s\",\"capability\":{"
+             "\"observation_id\":\"%s\",\"observed_at_epoch\":%lld,\"expires_at_epoch\":%lld,"
+             "\"range\":{\"kind\":\"clock\",\"start_epoch\":%lld,\"end_epoch\":%lld}}}",
+             source_id, observation.observation_id, (long long)observation.observed_at_epoch,
+             (long long)observation.expires_at_epoch, (long long)observation.clock_start_epoch,
+             (long long)observation.clock_end_epoch);
+  }
+  send_refplayer_json(c, STATUS_200, response);
+}
+
+static void handle_refplayer_rtsp_timeshift_resolve_request(connection_t *c, const char *query) {
+  char token[256];
+  char source_id[M3U_CATALOG_ID_SIZE];
+  char observation_id[REFPLAYER_RTSP_OBSERVATION_ID_SIZE];
+  char kind[16];
+  char target_seconds[64];
+  char target_epoch[32];
+  char canonical_target[64];
+  char media_url[HTTP_URL_BUFFER_SIZE * 2];
+  char response[HTTP_URL_BUFFER_SIZE * 3];
+  double npt_target = 0;
+  int64_t clock_target = 0;
+  refplayer_rtsp_observation_t observation;
+  const m3u_catalog_channel_t *channel;
+  service_t *configured;
+  char *base_url = NULL;
+  char *encoded_name = NULL;
+  char *encoded_token = NULL;
+  char *escaped_url = NULL;
+  int media_url_length;
+  refplayer_query_field_t fields[] = {
+      {"r2h-token", token, sizeof(token), 1, 0},
+      {"source_id", source_id, sizeof(source_id), 1, 0},
+      {"observation_id", observation_id, sizeof(observation_id), 1, 0},
+      {"kind", kind, sizeof(kind), 1, 0},
+      {"target_seconds", target_seconds, sizeof(target_seconds), 0, 0},
+      {"target_epoch", target_epoch, sizeof(target_epoch), 0, 0},
+  };
+
+  if (!c)
+    return;
+  if (strcmp(c->http_req.method, "GET") != 0) {
+    send_refplayer_json(c, STATUS_405, "{\"schema_version\":2,\"error\":\"method_not_allowed\"}");
+    return;
+  }
+  if (refplayer_parse_exact_query(query, fields, sizeof(fields) / sizeof(fields[0])) != 0 ||
+      !refplayer_query_token_matches(&fields[0]) || refplayer_rtsp_parse_source_id(source_id) != 0 ||
+      refplayer_rtsp_parse_observation_id(observation_id) != 0 ||
+      ((strcmp(kind, "npt") == 0) == (strcmp(kind, "clock") == 0)) ||
+      (strcmp(kind, "npt") == 0 && (!fields[4].seen || fields[5].seen ||
+                                     refplayer_rtsp_parse_npt_target(target_seconds, &npt_target) != 0)) ||
+      (strcmp(kind, "clock") == 0 && (!fields[5].seen || fields[4].seen ||
+                                       refplayer_rtsp_parse_clock_target(target_epoch, &clock_target) != 0))) {
+    send_refplayer_json(c, STATUS_400, "{\"schema_version\":2,\"error\":\"invalid_query\"}");
+    return;
+  }
+  channel = m3u_catalog_find_source(source_id);
+  configured = refplayer_catalog_rtsp_service(channel);
+  if (!configured || refplayer_rtsp_timeshift_find(source_id, observation_id, &observation) != 1) {
+    send_refplayer_json(c, STATUS_404, "{\"schema_version\":2,\"error\":\"unknown_observation\"}");
+    return;
+  }
+  if ((strcmp(kind, "npt") == 0 &&
+       !refplayer_rtsp_npt_target_is_valid(&observation, npt_target)) ||
+      (strcmp(kind, "clock") == 0 &&
+       !refplayer_rtsp_clock_target_is_valid(&observation, clock_target))) {
+    send_refplayer_json(c, STATUS_416, "{\"schema_version\":2,\"error\":\"target_out_of_range\"}");
+    return;
+  }
+  if ((strcmp(kind, "npt") == 0 &&
+       refplayer_rtsp_format_npt(npt_target, canonical_target, sizeof(canonical_target)) != 0) ||
+      (strcmp(kind, "clock") == 0 &&
+       snprintf(canonical_target, sizeof(canonical_target), "%lld", (long long)clock_target) <= 0)) {
+    send_refplayer_json(c, STATUS_500, "{\"schema_version\":2,\"error\":\"internal_error\"}");
+    return;
+  }
+  base_url = build_absolute_proxy_base_url(c->http_req.hostname, c->http_req.x_forwarded_host,
+                                           c->http_req.x_forwarded_proto);
+  encoded_name = http_url_encode(channel->service_name);
+  encoded_token = http_url_encode(config.r2h_token);
+  media_url_length = (!base_url || !encoded_name || !encoded_token)
+                         ? -1
+                         : snprintf(media_url, sizeof(media_url),
+                                    "%s%s?r2h-token=%s&r2h-refplayer-rtsp-source=%s&"
+                                    "r2h-refplayer-rtsp-observation=%s&r2h-refplayer-rtsp-kind=%s&"
+                                    "r2h-refplayer-rtsp-target=%s",
+                                    base_url, encoded_name, encoded_token, source_id, observation_id, kind,
+                                    canonical_target);
+  if (!base_url || strncmp(base_url, "http://127.0.0.1:", 17) != 0 || !encoded_name || !encoded_token ||
+      media_url_length < 0 ||
+      (size_t)media_url_length >= sizeof(media_url) || !(escaped_url = json_escape_string(media_url))) {
+    free(base_url);
+    free(encoded_name);
+    free(encoded_token);
+    send_refplayer_json(c, STATUS_500, "{\"schema_version\":2,\"error\":\"internal_error\"}");
+    return;
+  }
+  snprintf(response, sizeof(response),
+           "{\"schema_version\":2,\"source_id\":\"%s\",\"observation_id\":\"%s\","
+           "\"media_url\":\"%s\"}",
+           source_id, observation_id, escaped_url);
+  send_refplayer_json(c, STATUS_200, response);
+  free(escaped_url);
+  free(encoded_token);
+  free(encoded_name);
+  free(base_url);
+}
+
 static void handle_refplayer_catalog_request(connection_t *c) {
   char *catalog;
 
@@ -1389,7 +1762,7 @@ static void handle_refplayer_catalog_request(connection_t *c) {
     return;
   if (strcasecmp(c->http_req.method, "GET") != 0 && strcasecmp(c->http_req.method, "HEAD") != 0) {
     send_refplayer_json(c, STATUS_400,
-                        "{\"schema_version\":1,\"error\":\"Method not allowed; use GET\"}");
+                        "{\"schema_version\":2,\"error\":\"Method not allowed; use GET\"}");
     return;
   }
 
@@ -1397,7 +1770,7 @@ static void handle_refplayer_catalog_request(connection_t *c) {
                                            c->http_req.x_forwarded_proto);
   if (!catalog) {
     send_refplayer_json(c, STATUS_500,
-                        "{\"schema_version\":1,\"error\":\"Failed to generate catalog\"}");
+                        "{\"schema_version\":2,\"error\":\"Failed to generate catalog\"}");
     return;
   }
 
@@ -1414,14 +1787,14 @@ static void handle_refplayer_ready_request(connection_t *c) {
     return;
   if (strcasecmp(c->http_req.method, "GET") != 0 && strcasecmp(c->http_req.method, "HEAD") != 0) {
     send_refplayer_json(c, STATUS_400,
-                        "{\"schema_version\":1,\"error\":\"Method not allowed; use GET\"}");
+                        "{\"schema_version\":2,\"error\":\"Method not allowed; use GET\"}");
     return;
   }
 
   cache = m3u_get_cache();
   ready = m3u_refplayer_is_ready();
   snprintf(response, sizeof(response),
-           "{\"schema_version\":1,\"ready\":%s,\"catalog_channel_count\":%zu}", ready ? "true" : "false",
+           "{\"schema_version\":2,\"ready\":%s,\"catalog_channel_count\":%zu}", ready ? "true" : "false",
            cache ? cache->catalog_channel_count : 0);
   send_refplayer_json(c, ready ? STATUS_200 : STATUS_503, response);
 }

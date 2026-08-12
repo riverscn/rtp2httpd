@@ -6,9 +6,11 @@
 #include <sys/types.h>
 
 #include "stun.h"
+#include "service.h"
 
 /* Forward declaration */
 struct addrinfo;
+struct buffer_ref_s;
 
 /*
  * Endpoint advertised upstream for NAT traversal: either the STUN-discovered
@@ -66,6 +68,10 @@ typedef struct {
 
 /* Time conversion buffers - for playseek time formatting */
 #define RTSP_TIME_STRING_SIZE 64
+
+/* Archive requests may receive media before the PLAY Range acknowledgement.
+ * Retain a small bounded window until that control-plane result arrives. */
+#define RTSP_ARCHIVE_PENDING_PACKET_LIMIT 3
 
 /* Port string buffer - for port number conversion */
 #define RTSP_PORT_STRING_SIZE 16
@@ -156,6 +162,35 @@ typedef struct {
   int r2h_duration;
   float r2h_duration_value;
   int metadata_probe;
+  int refplayer_timeshift_enabled;
+  char refplayer_source_id[33];
+  char refplayer_observation_id[33];
+  char refplayer_session_id[33];
+  int refplayer_archive_request;
+  service_refplayer_range_kind_t refplayer_range_kind;
+  double refplayer_npt_target;
+  int64_t refplayer_clock_target;
+  int refplayer_play_range_valid;
+  int refplayer_play_range_invalid;
+  service_refplayer_range_kind_t refplayer_play_range_kind;
+  double refplayer_play_npt_start;
+  double refplayer_play_npt_end;
+  int64_t refplayer_play_clock_start;
+  int64_t refplayer_play_clock_end;
+  int refplayer_play_scale_compatible;
+  int refplayer_archive_ack_valid;
+  int refplayer_archive_ack_open_ended;
+  service_refplayer_range_kind_t refplayer_archive_ack_kind;
+  double refplayer_archive_ack_npt_start;
+  double refplayer_archive_ack_npt_end;
+  int64_t refplayer_archive_ack_clock_start;
+  int64_t refplayer_archive_ack_clock_end;
+  int refplayer_sdp_range_valid;
+  service_refplayer_range_kind_t refplayer_sdp_range_kind;
+  double refplayer_sdp_npt_start;
+  double refplayer_sdp_npt_end;
+  int64_t refplayer_sdp_clock_start;
+  int64_t refplayer_sdp_clock_end;
   /* Set once the control socket reports EOF.  Sticky: the session can never
    * continue after this, even if a complete response arrived alongside it. */
   int peer_closed;
@@ -221,8 +256,17 @@ typedef struct {
   uint64_t packets_dropped; /* Packets dropped due to backpressure */
 
   /* Cleanup state */
-  int cleanup_done;         /* Flag: cleanup has been completed */
-  int first_media_received; /* Flag: first media packet received in PLAYING */
+  int cleanup_done; /* Flag: cleanup has been completed */
+  /* Archive sessions commit their HTTP representation only after PLAY has
+   * acknowledged the requested Range. Ordinary live playback does not wait
+   * on this RefPlayer-specific state. */
+  int play_response_confirmed;
+  int media_evidence_confirmed;
+  int archive_commit_failed;
+  int refplayer_http_committed;
+  int first_media_received;
+  struct buffer_ref_s *archive_pending_packets[RTSP_ARCHIVE_PENDING_PACKET_LIMIT];
+  unsigned int archive_pending_packet_count;
 
   /* Non-blocking I/O state */
   char pending_request[RTSP_REQUEST_BUFFER_SIZE]; /* Request being sent */
@@ -360,5 +404,14 @@ int rtsp_session_tick(rtsp_session_t *session, int64_t now);
  * @param session RTSP session
  */
 void rtsp_resume_upstream(rtsp_session_t *session);
+
+/**
+ * Classify an SDP body for RefPlayer's narrow IPTV proxy capability.
+ *
+ * A result is proxyable only when there is exactly one media section and
+ * every payload offered by that section is explicitly MPEG-TS (static RTP
+ * payload type 33 or a matching media-level rtpmap MP2T declaration), or the
+ * media protocol itself explicitly declares direct MP2T transport.
+ */
 
 #endif /* __RTSP_H__ */

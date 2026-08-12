@@ -45,6 +45,12 @@ typedef enum {
   SEEK_MODE_RANGE = 1        /* Opt-in: enable Range: clock= path when in window */
 } seek_mode_t;
 
+typedef enum {
+  SERVICE_REFPLAYER_RANGE_NONE = 0,
+  SERVICE_REFPLAYER_RANGE_NPT,
+  SERVICE_REFPLAYER_RANGE_CLOCK
+} service_refplayer_range_kind_t;
+
 /* Default recency window when r2h-seek-mode=range is given without seconds */
 #define SEEK_MODE_DEFAULT_WINDOW_SECONDS 3600
 /* Upper bound on a configurable window — 24 hours */
@@ -75,6 +81,14 @@ typedef struct service_s {
   int seek_mode_tz_explicit;       /* 1 if range(...) explicitly specified a TZ */
   int seek_mode_tz_offset_seconds; /* TZ offset from range(TZ/...) when explicit */
   int seek_mode_window_seconds;    /* Recency window from range(.../seconds) */
+  /* Private RefPlayer RTSP capability authority. Fixed-size values avoid
+   * introducing ownership into ordinary service clone/free paths. */
+  char refplayer_source_id[33];
+  char refplayer_observation_id[33];
+  service_refplayer_range_kind_t refplayer_range_kind;
+  double refplayer_npt_target;
+  int64_t refplayer_clock_target;
+  int refplayer_archive_request;
   char *user_agent;                /* User-Agent header for timezone detection */
   char *ifname;                    /* Per-service upstream interface override (from r2h-ifname) */
   char *ifname_fcc;                /* Per-service FCC interface override (from r2h-ifname-fcc) */
@@ -235,6 +249,12 @@ service_t *service_create_with_query_merge(service_t *configured_service, const 
  */
 service_t *service_create_refplayer_catchup(service_t *configured_service, const char *start_epoch,
                                             const char *end_epoch, const char *user_agent);
+
+/* Clone an RTSP service and attach already-validated, typed archive authority.
+ * No query-string control is ever added to the upstream URL. */
+service_t *service_create_refplayer_rtsp_archive(service_t *configured_service, const char *source_id,
+                                                 const char *observation_id, service_refplayer_range_kind_t kind,
+                                                 double npt_target, int64_t clock_target);
 
 /**
  * Clone a service structure (deep copy)

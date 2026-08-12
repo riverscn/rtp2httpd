@@ -7,6 +7,7 @@
 #include "multicast.h"
 #include "platform_compat.h"
 #include "poller.h"
+#include "refplayer_rtsp_timeshift.h"
 #include "rtp.h"
 #include "status.h"
 #include "stream.h"
@@ -36,6 +37,7 @@
 static const char rtsp_default_user_agent[] = "rtp2httpd/" VERSION;
 #define RTSP_MAX_REDIRECTS 5
 #define RTSP_KEEPALIVE_INTERVAL_MS 30000
+#define RTSP_UNCONFIRMED_MEDIA_PACKET_LIMIT 32
 
 #define RTSP_RESPONSE_OK 0
 #define RTSP_RESPONSE_ADVANCE 1
@@ -53,6 +55,9 @@ static int rtsp_parse_response_header(rtsp_session_t *session, const char *respo
 static int rtsp_setup_udp_sockets(rtsp_session_t *session);
 static void rtsp_close_udp_sockets(rtsp_session_t *session, const char *reason);
 static char *rtsp_find_header(const char *response, const char *header_name);
+static unsigned int rtsp_header_count(const char *response, const char *header_name);
+static void rtsp_note_response_profile_facts(rtsp_session_t *session, const char *response);
+static void rtsp_note_describe_range_unit(rtsp_session_t *session, const char *sdp_body);
 static void rtsp_parse_transport_header(rtsp_session_t *session, const char *transport);
 static void rtsp_send_udp_nat_probe(rtsp_session_t *session);
 static int rtsp_capture_control_endpoints(rtsp_session_t *session);
@@ -69,6 +74,18 @@ static void rtsp_build_digest_response(rtsp_session_t *session, const char *meth
                                        size_t response_size);
 static int rtsp_build_basic_auth_header(rtsp_session_t *session, char *output, size_t output_size);
 static int rtsp_handle_terminal_socket_event(rtsp_session_t *session, uint32_t events);
+static void rtsp_release_archive_pending_packets(rtsp_session_t *session);
+
+static void rtsp_clear_refplayer_sdp_range(rtsp_session_t *session) {
+  if (!session)
+    return;
+  session->refplayer_sdp_range_valid = 0;
+  session->refplayer_sdp_range_kind = SERVICE_REFPLAYER_RANGE_NONE;
+  session->refplayer_sdp_npt_start = 0;
+  session->refplayer_sdp_npt_end = 0;
+  session->refplayer_sdp_clock_start = 0;
+  session->refplayer_sdp_clock_end = 0;
+}
 
 /**
  * Return the metadata block this session should update, or NULL when there is
@@ -79,6 +96,128 @@ static stream_metadata_t *rtsp_metadata(const rtsp_session_t *session) {
   if (!session || !session->conn || session->conn->stream.metadata.frozen)
     return NULL;
   return &session->conn->stream.metadata;
+}
+
+static void rtsp_release_archive_pending_packets(rtsp_session_t *session) {
+  if (!session)
+    return;
+  for (unsigned int index = 0; index < session->archive_pending_packet_count; index++) {
+    if (session->archive_pending_packets[index]) {
+      buffer_ref_put(session->archive_pending_packets[index]);
+      session->archive_pending_packets[index] = NULL;
+    }
+  }
+  session->archive_pending_packet_count = 0;
+}
+
+/* Takes ownership until PLAY acknowledges or rejects the archive target. */
+static int rtsp_hold_archive_pending_packet(rtsp_session_t *session, buffer_ref_t *packet) {
+  if (!session || !packet || session->archive_pending_packet_count >= RTSP_ARCHIVE_PENDING_PACKET_LIMIT)
+    return -1;
+  session->archive_pending_packets[session->archive_pending_packet_count++] = packet;
+  return 0;
+}
+
+static int rtsp_flush_archive_pending_packets(rtsp_session_t *session, connection_t *conn) {
+  int bytes_forwarded = 0;
+
+  if (!session || !conn)
+    return 0;
+  for (unsigned int index = 0; index < session->archive_pending_packet_count; index++) {
+    buffer_ref_t *packet = session->archive_pending_packets[index];
+    int result;
+
+    session->archive_pending_packets[index] = NULL;
+    if (!packet)
+      continue;
+    result = stream_process_rtp_payload(&conn->stream, packet, STREAM_MEDIA_ORIGIN_RTSP);
+    if (result > 0)
+      bytes_forwarded += result;
+    buffer_ref_put(packet);
+    if (result < 0) {
+      rtsp_release_archive_pending_packets(session);
+      return STREAM_EVENT_UNSUPPORTED_MEDIA;
+    }
+  }
+  session->archive_pending_packet_count = 0;
+  return bytes_forwarded;
+}
+
+/* Publish source authority only after the media path has actually queued the
+ * HTTP 200 response. PLAY/media evidence can precede RTP reorder output and
+ * therefore is not itself proof that the client received a usable stream. */
+static void rtsp_finalize_refplayer_http_commit(rtsp_session_t *session, connection_t *conn) {
+  refplayer_rtsp_observation_t range;
+  service_refplayer_range_kind_t kind;
+
+  if (!session || !conn || !session->refplayer_timeshift_enabled || session->refplayer_http_committed ||
+      !conn->headers_sent)
+    return;
+  session->refplayer_http_committed = 1;
+  if (session->refplayer_archive_request || !session->refplayer_play_scale_compatible ||
+      session->refplayer_play_range_invalid || !session->refplayer_source_id[0] ||
+      !session->refplayer_session_id[0] ||
+      (!session->refplayer_play_range_valid && !session->refplayer_sdp_range_valid))
+    return;
+
+  memset(&range, 0, sizeof(range));
+  kind = session->refplayer_play_range_valid ? session->refplayer_play_range_kind
+                                             : session->refplayer_sdp_range_kind;
+  if (kind == SERVICE_REFPLAYER_RANGE_NPT) {
+    range.kind = REFPLAYER_RTSP_RANGE_NPT;
+    range.npt_start = session->refplayer_play_range_valid ? session->refplayer_play_npt_start
+                                                          : session->refplayer_sdp_npt_start;
+    range.npt_end = session->refplayer_play_range_valid ? session->refplayer_play_npt_end
+                                                        : session->refplayer_sdp_npt_end;
+  } else if (kind == SERVICE_REFPLAYER_RANGE_CLOCK) {
+    range.kind = REFPLAYER_RTSP_RANGE_CLOCK;
+    range.clock_start_epoch = session->refplayer_play_range_valid ? session->refplayer_play_clock_start
+                                                                  : session->refplayer_sdp_clock_start;
+    range.clock_end_epoch = session->refplayer_play_range_valid ? session->refplayer_play_clock_end
+                                                                : session->refplayer_sdp_clock_end;
+  }
+  if (range.kind != REFPLAYER_RTSP_RANGE_NONE &&
+      refplayer_rtsp_timeshift_activate(session->refplayer_source_id, session->refplayer_session_id, &range) == 0)
+    (void)refplayer_rtsp_timeshift_publish(session->refplayer_source_id, &range, NULL);
+}
+
+/* Commit an archive representation exactly once. Live media uses the ordinary
+ * rtp2httpd path; only a typed archive target waits for PLAY acknowledgement. */
+static int rtsp_try_commit_archive_media(rtsp_session_t *session, connection_t *conn) {
+  int bytes_forwarded;
+  if (!session || !conn || !session->refplayer_timeshift_enabled || !session->refplayer_archive_request ||
+      session->first_media_received || session->archive_commit_failed ||
+      !session->play_response_confirmed || !session->media_evidence_confirmed)
+    return 0;
+  {
+    int covers_target = session->refplayer_play_scale_compatible && session->refplayer_archive_ack_valid &&
+                        session->refplayer_archive_ack_kind == session->refplayer_range_kind;
+    if (covers_target && session->refplayer_range_kind == SERVICE_REFPLAYER_RANGE_NPT)
+      covers_target = session->refplayer_archive_ack_open_ended
+                          ? fabs(session->refplayer_npt_target - session->refplayer_archive_ack_npt_start) <= 5e-10
+                          : session->refplayer_npt_target >= session->refplayer_archive_ack_npt_start &&
+                                session->refplayer_npt_target <= session->refplayer_archive_ack_npt_end;
+    if (covers_target && session->refplayer_range_kind == SERVICE_REFPLAYER_RANGE_CLOCK)
+      covers_target = session->refplayer_archive_ack_open_ended
+                          ? session->refplayer_clock_target == session->refplayer_archive_ack_clock_start
+                          : session->refplayer_clock_target >= session->refplayer_archive_ack_clock_start &&
+                                session->refplayer_clock_target <= session->refplayer_archive_ack_clock_end;
+    if (!covers_target) {
+      logger(LOG_WARN, "RTSP: Archive PLAY response did not acknowledge the requested typed target");
+      rtsp_release_archive_pending_packets(session);
+      session->archive_commit_failed = 1;
+      return STREAM_EVENT_UNSUPPORTED_MEDIA;
+    }
+  }
+  session->first_media_received = 1;
+  logger(LOG_DEBUG, "RTSP: Committing archive media after successful PLAY Range acknowledgement");
+  bytes_forwarded = rtsp_flush_archive_pending_packets(session, conn);
+  if (bytes_forwarded == STREAM_EVENT_UNSUPPORTED_MEDIA) {
+    session->archive_commit_failed = 1;
+    return STREAM_EVENT_UNSUPPORTED_MEDIA;
+  }
+  rtsp_finalize_refplayer_http_commit(session, conn);
+  return bytes_forwarded;
 }
 
 static const char *rtsp_get_user_agent(void) {
@@ -283,6 +422,8 @@ static int rtsp_build_basic_auth_header(rtsp_session_t *session, char *output, s
 }
 
 void rtsp_session_init(rtsp_session_t *session) {
+  const char *timeshift = getenv("RTP2HTTPD_REFPLAYER_TIMESHIFT");
+
   memset(session, 0, sizeof(rtsp_session_t));
   session->initialized = 1;
   session->state = RTSP_STATE_INIT;
@@ -301,6 +442,8 @@ void rtsp_session_init(rtsp_session_t *session) {
   session->r2h_duration = 0;
   session->r2h_duration_value = -1;
   session->metadata_probe = 0;
+  session->refplayer_timeshift_enabled = timeshift && strcmp(timeshift, "1") == 0;
+  session->refplayer_play_scale_compatible = 1;
   session->peer_closed = 0;
   session->connect_generation = 0;
   session->control_local_ip4.s_addr = INADDR_ANY;
@@ -997,8 +1140,12 @@ static int rtsp_handle_terminal_socket_event(rtsp_session_t *session, uint32_t e
   /* During PLAYING: upstream is done — drain pending client output
    * before disconnecting regardless of error/hangup distinction. */
   if (session->state == RTSP_STATE_PLAYING) {
+    int failed_before_confirmation = session->refplayer_archive_request &&
+                                     (!session->conn || !session->conn->headers_sent);
     logger(LOG_INFO, "RTSP: Upstream closed during PLAYING, draining client");
     rtsp_force_cleanup(session);
+    if (failed_before_confirmation)
+      return STREAM_EVENT_UNSUPPORTED_MEDIA;
     if (session->conn && session->conn->state != CONN_CLOSING) {
       session->conn->state = CONN_CLOSING;
       connection_epoll_update_events(session->conn->epfd, session->conn->fd,
@@ -1209,11 +1356,18 @@ int rtsp_handle_socket_event(rtsp_session_t *session, uint32_t events) {
 
     if (session->state == RTSP_STATE_PLAYING) {
       result = rtsp_handle_tcp_interleaved_data(session, session->conn);
+      if (result == STREAM_EVENT_UNSUPPORTED_MEDIA) {
+        return STREAM_EVENT_UNSUPPORTED_MEDIA;
+      }
       if (result < 0) {
+        int failed_before_confirmation = session->refplayer_archive_request &&
+                                         (!session->conn || !session->conn->headers_sent);
         /* Upstream gone (EOF or recv error): drain pending client output */
         logger(LOG_DEBUG, "RTSP: TCP interleaved upstream closed during PLAYING, "
                           "draining client");
         rtsp_force_cleanup(session);
+        if (failed_before_confirmation)
+          return STREAM_EVENT_UNSUPPORTED_MEDIA;
         if (session->conn && session->conn->state != CONN_CLOSING) {
           session->conn->state = CONN_CLOSING;
           connection_epoll_update_events(session->conn->epfd, session->conn->fd,
@@ -1652,6 +1806,11 @@ static int rtsp_try_receive_response(rtsp_session_t *session) {
     } else {
       session->response_buffer_pos = 0;
     }
+    /* Archive media can arrive before PLAY. Release it only after the server
+     * has acknowledged the requested typed Range; ordinary live playback is
+     * never held behind this RefPlayer-specific correctness check. */
+    if (rtsp_try_commit_archive_media(session, session->conn) == STREAM_EVENT_UNSUPPORTED_MEDIA)
+      return RTSP_RESPONSE_ERROR;
   } else if (session->state == RTSP_STATE_AWAITING_TEARDOWN) {
     rtsp_session_set_state(session, RTSP_STATE_TEARDOWN_COMPLETE);
     logger(LOG_INFO, "RTSP: TEARDOWN response received");
@@ -1867,7 +2026,17 @@ int rtsp_state_machine_advance(rtsp_session_t *session) {
   }
 
   case RTSP_STATE_SETUP:
-    if (session->use_playseek_range && session->playseek_range_start[0] != '\0') {
+    if (session->refplayer_archive_request && session->refplayer_range_kind == SERVICE_REFPLAYER_RANGE_CLOCK) {
+      char clock_start[RTSP_TIME_STRING_SIZE];
+      if (refplayer_rtsp_format_clock(session->refplayer_clock_target, clock_start, sizeof(clock_start)) != 0)
+        return -1;
+      snprintf(extra_headers, sizeof(extra_headers), "Range: clock=%s-\r\n", clock_start);
+    } else if (session->refplayer_archive_request && session->refplayer_range_kind == SERVICE_REFPLAYER_RANGE_NPT) {
+      char npt_start[RTSP_TIME_STRING_SIZE];
+      if (refplayer_rtsp_format_npt(session->refplayer_npt_target, npt_start, sizeof(npt_start)) != 0)
+        return -1;
+      snprintf(extra_headers, sizeof(extra_headers), "Range: npt=%s-\r\n", npt_start);
+    } else if (session->use_playseek_range && session->playseek_range_start[0] != '\0') {
       snprintf(extra_headers, sizeof(extra_headers), "Range: clock=%s-\r\n", session->playseek_range_start);
     } else if (session->r2h_start[0] != '\0') {
       snprintf(extra_headers, sizeof(extra_headers), "Range: npt=%s-\r\n", session->r2h_start);
@@ -1942,7 +2111,8 @@ int rtsp_session_tick(rtsp_session_t *session, int64_t now) {
       timeout_sec = RTSP_HANDSHAKE_TIMEOUT_SEC;
       break;
     case RTSP_STATE_PLAYING:
-      if (!session->first_media_received)
+      if (session->refplayer_archive_request ? !session->refplayer_http_committed
+                                             : !session->first_media_received)
         timeout_sec = RTSP_FIRST_MEDIA_TIMEOUT_SEC;
       break;
     case RTSP_STATE_SENDING_TEARDOWN:
@@ -2104,6 +2274,24 @@ static int rtsp_process_interleaved_buffer(rtsp_session_t *session, connection_t
         if (packet_buf) {
           memcpy(packet_buf->data, &session->response_buffer[4], packet_length);
           packet_buf->data_size = (size_t)packet_length;
+          if (!session->first_media_received && session->refplayer_archive_request) {
+            if (session->media_evidence_confirmed) {
+              buffer_ref_put(packet_buf);
+              goto consume_interleaved_packet;
+            }
+            if (rtsp_hold_archive_pending_packet(session, packet_buf) != 0) {
+              buffer_ref_put(packet_buf);
+              rtsp_release_archive_pending_packets(session);
+              return STREAM_EVENT_UNSUPPORTED_MEDIA;
+            }
+            session->media_evidence_confirmed = 1;
+            logger(LOG_DEBUG, "RTSP: Archive media arrived over TCP, waiting for PLAY Range acknowledgement");
+            int commit_result = rtsp_try_commit_archive_media(session, conn);
+            if (commit_result == STREAM_EVENT_UNSUPPORTED_MEDIA)
+              return STREAM_EVENT_UNSUPPORTED_MEDIA;
+            bytes_forwarded += commit_result;
+            goto consume_interleaved_packet;
+          }
           if (!session->first_media_received) {
             session->first_media_received = 1;
             logger(LOG_DEBUG, "RTSP: First media packet received (TCP)");
@@ -2111,6 +2299,7 @@ static int rtsp_process_interleaved_buffer(rtsp_session_t *session, connection_t
           int pb = stream_process_rtp_payload(&conn->stream, packet_buf, STREAM_MEDIA_ORIGIN_RTSP);
           if (pb > 0)
             bytes_forwarded += pb;
+          rtsp_finalize_refplayer_http_commit(session, conn);
           buffer_ref_put(packet_buf);
         } else {
           session->packets_dropped++;
@@ -2121,6 +2310,8 @@ static int rtsp_process_interleaved_buffer(rtsp_session_t *session, connection_t
       }
     }
 
+  consume_interleaved_packet:
+    ;
     /* Remove processed packet from buffer */
     int total_packet_size = 4 + packet_length;
     memmove(session->response_buffer, &session->response_buffer[total_packet_size],
@@ -2248,11 +2439,30 @@ int rtsp_handle_udp_rtp_data(rtsp_session_t *session, connection_t *conn) {
     }
 
     rtp_buf->data_size = (size_t)bytes_received;
+    if (!session->first_media_received && session->refplayer_archive_request) {
+      if (session->media_evidence_confirmed) {
+        buffer_ref_put(rtp_buf);
+        continue;
+      }
+      if (rtsp_hold_archive_pending_packet(session, rtp_buf) != 0) {
+        buffer_ref_put(rtp_buf);
+        rtsp_release_archive_pending_packets(session);
+        return STREAM_EVENT_UNSUPPORTED_MEDIA;
+      }
+      session->media_evidence_confirmed = 1;
+      logger(LOG_DEBUG, "RTSP: Archive media arrived over UDP, waiting for PLAY Range acknowledgement");
+      int commit_result = rtsp_try_commit_archive_media(session, conn);
+      if (commit_result == STREAM_EVENT_UNSUPPORTED_MEDIA)
+        return STREAM_EVENT_UNSUPPORTED_MEDIA;
+      total_bytes_written += commit_result;
+      continue;
+    }
     if (!session->first_media_received) {
       session->first_media_received = 1;
       logger(LOG_DEBUG, "RTSP: First media packet received (UDP)");
     }
     int pb = stream_process_rtp_payload(&conn->stream, rtp_buf, STREAM_MEDIA_ORIGIN_RTSP);
+    rtsp_finalize_refplayer_http_commit(session, conn);
     buffer_ref_put(rtp_buf);
     if (pb > 0)
       total_bytes_written += pb;
@@ -2266,6 +2476,11 @@ int rtsp_handle_udp_rtp_data(rtsp_session_t *session, connection_t *conn) {
  * Used when TEARDOWN cannot be sent or after TEARDOWN completes
  */
 static void rtsp_force_cleanup(rtsp_session_t *session) {
+  /* Strict mode may still own the bounded pre-header evidence window. */
+  rtsp_release_archive_pending_packets(session);
+  if (session->refplayer_source_id[0] && session->refplayer_session_id[0])
+    refplayer_rtsp_timeshift_deactivate(session->refplayer_source_id, session->refplayer_session_id);
+
   /* Close and remove RTSP control socket from poller */
   if (session->socket >= 0) {
     worker_cleanup_socket_from_epoll(session->epoll_fd, session->socket);
@@ -2521,6 +2736,9 @@ static int rtsp_parse_response_header(rtsp_session_t *session, const char *respo
     }
   }
 
+  if (status_code == 200)
+    rtsp_note_response_profile_facts(session, rtsp_start);
+
   /* Handle different status code ranges */
   if (status_code >= 300 && status_code < 400) {
     /* Redirection response */
@@ -2578,10 +2796,14 @@ static int rtsp_parse_response_header(rtsp_session_t *session, const char *respo
      * unauthenticated attempt's answers so a failed retry cannot report them. */
     if (session->state == RTSP_STATE_AWAITING_DESCRIBE) {
       stream_metadata_forget(rtsp_metadata(session), STREAM_METADATA_STAGE_DESCRIBE);
+      rtsp_clear_refplayer_sdp_range(session);
     } else if (session->state == RTSP_STATE_AWAITING_SETUP) {
       stream_metadata_forget(rtsp_metadata(session), STREAM_METADATA_STAGE_SETUP);
     } else if (session->state == RTSP_STATE_AWAITING_PLAY) {
       stream_metadata_forget(rtsp_metadata(session), STREAM_METADATA_STAGE_PLAY);
+      session->play_response_confirmed = 0;
+      session->media_evidence_confirmed = 0;
+      rtsp_release_archive_pending_packets(session);
     }
 
     /* Move state back to retry the same request */
@@ -2621,6 +2843,7 @@ static int rtsp_parse_response_header(rtsp_session_t *session, const char *respo
 
   if (session->state == RTSP_STATE_AWAITING_PLAY) {
     rtsp_parse_play_metadata(session, rtsp_start);
+    session->play_response_confirmed = 1;
   }
 
   /* Parse Public header from OPTIONS response to determine supported methods */
@@ -2938,20 +3161,130 @@ static char *rtsp_find_header(const char *response, const char *header_name) {
   return NULL;
 }
 
+static unsigned int rtsp_header_count(const char *response, const char *header_name) {
+  const char *line;
+  size_t name_len;
+  unsigned int count = 0;
+
+  if (!response || !header_name || !(line = strstr(response, "\r\n")))
+    return 0;
+  line += 2;
+  name_len = strlen(header_name);
+  while (*line) {
+    const char *line_end = strstr(line, "\r\n");
+    const char *colon;
+    if (!line_end || line_end == line)
+      break;
+    colon = memchr(line, ':', (size_t)(line_end - line));
+    if (colon && (size_t)(colon - line) == name_len && strncasecmp(line, header_name, name_len) == 0)
+      count++;
+    line = line_end + 2;
+  }
+  return count;
+}
+
+static int rtsp_copy_visible_header(char *output, size_t output_size, const char *value) {
+  size_t length;
+  if (!output || output_size == 0 || !value || !(length = strlen(value)) || length >= output_size)
+    return -1;
+  for (size_t index = 0; index < length; index++) {
+    unsigned char ch = (unsigned char)value[index];
+    if (ch < 0x20 || ch > 0x7e)
+      return -1;
+  }
+  memcpy(output, value, length + 1);
+  return 0;
+}
+
+/* Preserve bounded protocol facts for the Host's routing policy. rtp2httpd
+ * does not assign a vendor profile or decide whether a source is IPTV. */
+static void rtsp_note_response_profile_facts(rtsp_session_t *session, const char *response) {
+  stream_metadata_t *metadata = rtsp_metadata(session);
+  char *server;
+  char *timeshift_status;
+  if (!metadata || !response)
+    return;
+
+  server = rtsp_find_header(response, "Server");
+  if (server) {
+    if (rtsp_header_count(response, "Server") == 1 &&
+        rtsp_copy_visible_header(metadata->rtsp_server, sizeof(metadata->rtsp_server), server) != 0)
+      metadata->rtsp_server[0] = '\0';
+    free(server);
+  }
+
+  timeshift_status = rtsp_find_header(response, "Timeshift-Status");
+  if (timeshift_status) {
+    if (rtsp_header_count(response, "Timeshift-Status") == 1 &&
+        (strcmp(timeshift_status, "0") == 0 || strcmp(timeshift_status, "1") == 0)) {
+      metadata->rtsp_timeshift_status = (int8_t)(timeshift_status[0] - '0');
+      metadata->rtsp_timeshift_status_known = 1;
+    } else {
+      metadata->rtsp_timeshift_status = 0;
+      metadata->rtsp_timeshift_status_known = 0;
+    }
+    free(timeshift_status);
+  }
+}
+
+static void rtsp_note_describe_range_unit(rtsp_session_t *session, const char *sdp_body) {
+  stream_metadata_t *metadata = rtsp_metadata(session);
+  stream_rtsp_range_unit_t observed = STREAM_RTSP_RANGE_UNKNOWN;
+  const char *line = sdp_body;
+  if (!metadata || !sdp_body)
+    return;
+
+  metadata->rtsp_describe_range_unit = STREAM_RTSP_RANGE_UNKNOWN;
+  while (*line) {
+    const char *line_end = strpbrk(line, "\r\n");
+    size_t line_length = line_end ? (size_t)(line_end - line) : strlen(line);
+    stream_rtsp_range_unit_t current = STREAM_RTSP_RANGE_UNKNOWN;
+    if (line_length > 8 && strncasecmp(line, "a=range:", 8) == 0) {
+      const char *value = line + 8;
+      size_t value_length = line_length - 8;
+      if (value_length > 4 && strncasecmp(value, "npt=", 4) == 0)
+        current = STREAM_RTSP_RANGE_NPT;
+      else if (value_length > 6 && strncasecmp(value, "clock=", 6) == 0)
+        current = STREAM_RTSP_RANGE_CLOCK;
+      else if (value_length > 6 && strncasecmp(value, "smpte=", 6) == 0)
+        current = STREAM_RTSP_RANGE_SMPTE;
+      if (current != STREAM_RTSP_RANGE_UNKNOWN) {
+        if (observed != STREAM_RTSP_RANGE_UNKNOWN && observed != current) {
+          metadata->rtsp_describe_range_unit = STREAM_RTSP_RANGE_UNKNOWN;
+          return;
+        }
+        observed = current;
+      }
+    }
+    if (!line_end)
+      break;
+    line = line_end;
+    while (*line == '\r' || *line == '\n')
+      line++;
+  }
+  metadata->rtsp_describe_range_unit = observed;
+}
+
 static void rtsp_parse_play_metadata(rtsp_session_t *session, const char *response) {
   stream_metadata_t *metadata;
   char *scale_header;
   char *range_header;
 
-  if (!response)
+  if (!session || !response)
     return;
 
   metadata = rtsp_metadata(session);
-  if (!metadata)
-    return;
+  session->refplayer_play_range_valid = 0;
+  session->refplayer_play_range_invalid = 0;
+  session->refplayer_archive_ack_valid = 0;
+  session->refplayer_archive_ack_open_ended = 0;
+  session->refplayer_play_scale_compatible = 1;
 
   scale_header = rtsp_find_header(response, "Scale");
-  if (scale_header) {
+  if (rtsp_header_count(response, "Scale") > 1) {
+    session->refplayer_play_scale_compatible = 0;
+    free(scale_header);
+  } else if (scale_header) {
     char *end = NULL;
     double scale;
 
@@ -2960,24 +3293,69 @@ static void rtsp_parse_play_metadata(rtsp_session_t *session, const char *respon
     while (end && (*end == ' ' || *end == '\t'))
       end++;
     if (end != scale_header && end && *end == '\0' && errno != ERANGE && isfinite(scale)) {
-      metadata->playback_scale = scale;
-      metadata->playback_scale_known = 1;
-    }
+      if (metadata) {
+        metadata->playback_scale = scale;
+        metadata->playback_scale_known = 1;
+      }
+      if (scale != 1.0)
+        session->refplayer_play_scale_compatible = 0;
+    } else
+      session->refplayer_play_scale_compatible = 0;
     free(scale_header);
   }
 
   range_header = rtsp_find_header(response, "Range");
-  if (range_header) {
+  unsigned int range_count = rtsp_header_count(response, "Range");
+  if (range_count > 1) {
+    session->refplayer_play_range_invalid = 1;
+    free(range_header);
+  } else if (range_header && range_count == 1) {
+    refplayer_rtsp_observation_t parsed_range;
+    refplayer_rtsp_observation_t parsed_ack;
+    int archive_open_ended = 0;
+    int legal_open_ended = 0;
     size_t len = strlen(range_header);
-    int valid = len > 0 && len < sizeof(metadata->playback_range);
+    int valid = len > 0 && (!metadata || len < sizeof(metadata->playback_range));
 
     for (size_t i = 0; valid && i < len; i++) {
       unsigned char ch = (unsigned char)range_header[i];
       if (ch < 0x20 || ch > 0x7e)
         valid = 0;
     }
-    if (valid) {
+    if (valid && metadata) {
       memcpy(metadata->playback_range, range_header, len + 1);
+    }
+    legal_open_ended = valid &&
+                       refplayer_rtsp_parse_archive_ack(range_header, &parsed_ack, &archive_open_ended) == 0 &&
+                       archive_open_ended;
+    if (valid && session->refplayer_play_scale_compatible &&
+        refplayer_rtsp_parse_play_range(range_header, &parsed_range) == 0) {
+      session->refplayer_play_range_valid = 1;
+      if (parsed_range.kind == REFPLAYER_RTSP_RANGE_NPT) {
+        session->refplayer_play_range_kind = SERVICE_REFPLAYER_RANGE_NPT;
+        session->refplayer_play_npt_start = parsed_range.npt_start;
+        session->refplayer_play_npt_end = parsed_range.npt_end;
+      } else if (parsed_range.kind == REFPLAYER_RTSP_RANGE_CLOCK) {
+        session->refplayer_play_range_kind = SERVICE_REFPLAYER_RANGE_CLOCK;
+        session->refplayer_play_clock_start = parsed_range.clock_start_epoch;
+        session->refplayer_play_clock_end = parsed_range.clock_end_epoch;
+      }
+    } else if (!session->refplayer_archive_request && !legal_open_ended) {
+      session->refplayer_play_range_invalid = 1;
+    }
+    if (valid && session->refplayer_play_scale_compatible && session->refplayer_archive_request &&
+        refplayer_rtsp_parse_archive_ack(range_header, &parsed_range, &archive_open_ended) == 0) {
+      session->refplayer_archive_ack_valid = 1;
+      session->refplayer_archive_ack_open_ended = archive_open_ended;
+      if (parsed_range.kind == REFPLAYER_RTSP_RANGE_NPT) {
+        session->refplayer_archive_ack_kind = SERVICE_REFPLAYER_RANGE_NPT;
+        session->refplayer_archive_ack_npt_start = parsed_range.npt_start;
+        session->refplayer_archive_ack_npt_end = parsed_range.npt_end;
+      } else {
+        session->refplayer_archive_ack_kind = SERVICE_REFPLAYER_RANGE_CLOCK;
+        session->refplayer_archive_ack_clock_start = parsed_range.clock_start_epoch;
+        session->refplayer_archive_ack_clock_end = parsed_range.clock_end_epoch;
+      }
     }
     free(range_header);
   }
@@ -3013,7 +3391,9 @@ static void rtsp_resolve_relative_url(const char *base_url, const char *relative
   }
 }
 
-static int rtsp_sdp_describes_mp2t_rtp(const char *sdp_body) {
+/* Keep the upstream daemon's permissive SDP metadata hint intact. RefPlayer
+ * routing consumes this only as a neutral HEAD response fact. */
+static int rtsp_sdp_describes_mp2t_rtp_legacy(const char *sdp_body) {
   const char *line = sdp_body;
 
   while (line && *line != '\0') {
@@ -3023,9 +3403,9 @@ static int rtsp_sdp_describes_mp2t_rtp(const char *sdp_body) {
     if (line_len > 9 && strncasecmp(line, "a=rtpmap:", 9) == 0) {
       int payload_type;
       char encoding[32];
-      if (sscanf(line, "a=rtpmap:%d %31[^/\r\n]", &payload_type, encoding) == 2 && strcasecmp(encoding, "MP2T") == 0) {
+      if (sscanf(line, "a=rtpmap:%d %31[^/\r\n]", &payload_type, encoding) == 2 &&
+          strcasecmp(encoding, "MP2T") == 0)
         return 1;
-      }
     } else if (line_len > 2 && strncasecmp(line, "m=", 2) == 0) {
       char media[32];
       char transport[64];
@@ -3108,6 +3488,102 @@ static int rtsp_parse_npt_time(const char *value, const char **end_out, double *
   return 0;
 }
 
+static int rtsp_refplayer_ranges_equal(const refplayer_rtsp_observation_t *left,
+                                       const refplayer_rtsp_observation_t *right) {
+  if (!left || !right || left->kind != right->kind)
+    return 0;
+  if (left->kind == REFPLAYER_RTSP_RANGE_NPT)
+    return left->npt_start == right->npt_start && left->npt_end == right->npt_end;
+  if (left->kind == REFPLAYER_RTSP_RANGE_CLOCK)
+    return left->clock_start_epoch == right->clock_start_epoch &&
+           left->clock_end_epoch == right->clock_end_epoch;
+  return 0;
+}
+
+static void rtsp_refplayer_consider_sdp_range(refplayer_rtsp_observation_t *candidate, int *present,
+                                              int *conflict, const char *value, size_t value_len) {
+  refplayer_rtsp_observation_t parsed;
+  char buffer[128];
+
+  if (!candidate || !present || !conflict || !value || value_len == 0 || value_len >= sizeof(buffer)) {
+    if (conflict)
+      *conflict = 1;
+    return;
+  }
+  memcpy(buffer, value, value_len);
+  buffer[value_len] = '\0';
+  if (refplayer_rtsp_parse_play_range(buffer, &parsed) != 0) {
+    *conflict = 1;
+    return;
+  }
+  if (*present && !rtsp_refplayer_ranges_equal(candidate, &parsed)) {
+    *conflict = 1;
+    return;
+  }
+  *candidate = parsed;
+  *present = 1;
+}
+
+/* Keep SDP source-window evidence separate from legacy duration metadata.
+ * The first media section is the one the existing rtp2httpd client SETUPs;
+ * its range wins over a session-level fallback, while malformed or
+ * contradictory evidence grants no RefPlayer archive capability. */
+static void rtsp_parse_refplayer_sdp_range(rtsp_session_t *session, const char *sdp_body) {
+  refplayer_rtsp_observation_t session_candidate = {0};
+  refplayer_rtsp_observation_t media_candidate = {0};
+  const refplayer_rtsp_observation_t *selected = NULL;
+  int session_present = 0;
+  int session_conflict = 0;
+  int media_present = 0;
+  int media_conflict = 0;
+  unsigned int media_index = 0;
+  const char *line = sdp_body;
+
+  rtsp_clear_refplayer_sdp_range(session);
+  if (!sdp_body)
+    return;
+
+  while (*line) {
+    const char *line_end = strpbrk(line, "\r\n");
+    size_t line_len = line_end ? (size_t)(line_end - line) : strlen(line);
+    if (line_len >= 2 && strncmp(line, "m=", 2) == 0) {
+      media_index++;
+    } else if (line_len > 8 && strncmp(line, "a=range:", 8) == 0) {
+      if (media_index == 0)
+        rtsp_refplayer_consider_sdp_range(&session_candidate, &session_present, &session_conflict,
+                                          line + 8, line_len - 8);
+      else if (media_index == 1)
+        rtsp_refplayer_consider_sdp_range(&media_candidate, &media_present, &media_conflict,
+                                          line + 8, line_len - 8);
+    }
+    if (!line_end)
+      break;
+    line = line_end;
+    while (*line == '\r' || *line == '\n')
+      line++;
+  }
+
+  if (media_conflict || session_conflict)
+    return;
+  if (media_present && session_present &&
+      !rtsp_refplayer_ranges_equal(&media_candidate, &session_candidate))
+    return;
+  selected = media_present ? &media_candidate : (session_present ? &session_candidate : NULL);
+  if (!selected)
+    return;
+
+  session->refplayer_sdp_range_valid = 1;
+  if (selected->kind == REFPLAYER_RTSP_RANGE_NPT) {
+    session->refplayer_sdp_range_kind = SERVICE_REFPLAYER_RANGE_NPT;
+    session->refplayer_sdp_npt_start = selected->npt_start;
+    session->refplayer_sdp_npt_end = selected->npt_end;
+  } else if (selected->kind == REFPLAYER_RTSP_RANGE_CLOCK) {
+    session->refplayer_sdp_range_kind = SERVICE_REFPLAYER_RANGE_CLOCK;
+    session->refplayer_sdp_clock_start = selected->clock_start_epoch;
+    session->refplayer_sdp_clock_end = selected->clock_end_epoch;
+  }
+}
+
 /**
  * Parse DESCRIBE response SDP body in a single pass.
  *
@@ -3132,12 +3608,15 @@ static void rtsp_parse_describe_sdp(rtsp_session_t *session, const char *header_
   char *content_base = rtsp_find_header(header_start, "Content-Base");
   const char *base_url = content_base ? content_base : session->server_url;
 
+  rtsp_note_describe_range_unit(session, sdp_body);
+  rtsp_parse_refplayer_sdp_range(session, sdp_body);
   if (*sdp_body == '\0')
     goto done;
 
-  if (metadata && rtsp_sdp_describes_mp2t_rtp(sdp_body)) {
+  /* Preserve the upstream daemon's metadata-only SDP hint. Strict capability
+   * enforcement applies only to a real media GET and never vetoes HEAD. */
+  if (metadata && rtsp_sdp_describes_mp2t_rtp_legacy(sdp_body))
     metadata->upstream_payload = STREAM_PAYLOAD_MP2T_RTP;
-  }
 
   /* --- a=control: → setup_url ----------------------------------------- */
 
@@ -3179,12 +3658,12 @@ static void rtsp_parse_describe_sdp(rtsp_session_t *session, const char *header_
     }
   }
 
-  /* --- a=range:npt= → r2h_duration_value ------------------------------ */
+  /* --- a=range → duration metadata and post-PLAY RefPlayer evidence ---- */
 
   {
-    const char *range = strstr(sdp_body, "a=range:npt=");
+    const char *range = strstr(sdp_body, "a=range:");
     if (range) {
-      const char *val = range + 12; /* skip "a=range:npt=" */
+      const char *val = range + 8; /* skip "a=range:" */
       const char *val_end = strpbrk(val, "\r\n");
       size_t len;
       char buf[64];
@@ -3201,7 +3680,8 @@ static void rtsp_parse_describe_sdp(rtsp_session_t *session, const char *header_
 
         memcpy(buf, val, len);
         buf[len] = '\0';
-        if (rtsp_parse_npt_time(buf, &start_end, &range_start) == 0 && *start_end == '-') {
+        if (strncmp(buf, "npt=", 4) == 0 && rtsp_parse_npt_time(buf + 4, &start_end, &range_start) == 0 &&
+            *start_end == '-') {
           if (rtsp_parse_npt_time(start_end + 1, &end_end, &range_end) == 0 && *end_end == '\0' &&
               range_end >= range_start) {
             logger(LOG_DEBUG, "RTSP: Range: %.3f-%.3f", range_start, range_end);
@@ -3355,16 +3835,25 @@ static void rtsp_parse_transport_header(rtsp_session_t *session, const char *tra
   char *client_port_param;
   char *source_param;
   char source_address[RTSP_SERVER_HOST_SIZE] = {0};
+  int transport_is_mp2t_rtp;
+  int transport_is_mp2t_direct;
+  int transport_is_tcp;
   stream_metadata_t *metadata = rtsp_metadata(session);
 
   logger(LOG_DEBUG, "RTSP: Parsing server transport response: %s", transport);
 
+  /* The SETUP response is the transport authority. RefPlayer capability
+   * tracking must never reinterpret or veto normal rtp2httpd negotiation. */
+  transport_is_mp2t_rtp = strstr(transport, "MP2T/RTP") != NULL;
+  transport_is_mp2t_direct = !transport_is_mp2t_rtp && strstr(transport, "MP2T") != NULL;
+  transport_is_tcp = strstr(transport, "TCP") != NULL || strstr(transport, "interleaved=") != NULL;
+
   /* Determine transport protocol and mode */
-  if (strstr(transport, "MP2T/RTP")) {
+  if (transport_is_mp2t_rtp) {
     /* MP2T/RTP - MPEG-2 TS over RTP (needs RTP unwrapping) */
     session->transport_protocol = RTSP_PROTOCOL_RTP;
     logger(LOG_INFO, "RTSP: Server selected MP2T/RTP transport");
-  } else if (strstr(transport, "MP2T")) {
+  } else if (transport_is_mp2t_direct) {
     /* MP2T - Direct MPEG-2 TS (no RTP unwrapping) */
     session->transport_protocol = RTSP_PROTOCOL_MP2T;
     logger(LOG_INFO, "RTSP: Server selected MP2T transport");
@@ -3375,7 +3864,7 @@ static void rtsp_parse_transport_header(rtsp_session_t *session, const char *tra
   }
 
   /* Determine transport mode: TCP or UDP */
-  if (strstr(transport, "TCP") || strstr(transport, "interleaved=")) {
+  if (transport_is_tcp) {
     /* TCP transport mode */
     session->transport_mode = RTSP_TRANSPORT_TCP;
     if (metadata)
@@ -3390,7 +3879,8 @@ static void rtsp_parse_transport_header(rtsp_session_t *session, const char *tra
     /* Parse interleaved channels */
     interleaved_param = strstr(transport, "interleaved=");
     if (interleaved_param) {
-      if (sscanf(interleaved_param, "interleaved=%d-%d", &session->rtp_channel, &session->rtcp_channel) == 2) {
+      if (sscanf(interleaved_param, "interleaved=%d-%d", &session->rtp_channel,
+                 &session->rtcp_channel) == 2) {
         logger(LOG_DEBUG, "RTSP: Server confirmed TCP interleaved channels: %d/%d", session->rtp_channel,
                session->rtcp_channel);
       }
@@ -3436,7 +3926,8 @@ static void rtsp_parse_transport_header(rtsp_session_t *session, const char *tra
     /* Parse server port parameters */
     server_port_param = strstr(transport, "server_port=");
     if (server_port_param) {
-      if (sscanf(server_port_param, "server_port=%d-%d", &session->server_rtp_port, &session->server_rtcp_port) != 2) {
+      if (sscanf(server_port_param, "server_port=%d-%d", &session->server_rtp_port,
+                 &session->server_rtcp_port) != 2) {
         /* Try single port format */
         session->server_rtp_port = atoi(server_port_param + 12);
         session->server_rtcp_port = session->server_rtp_port + 1;
@@ -3456,6 +3947,7 @@ static void rtsp_parse_transport_header(rtsp_session_t *session, const char *tra
     /* Punch the media path now that the server has confirmed UDP */
     rtsp_send_udp_nat_probe(session);
   }
+
 }
 
 /*
@@ -3481,6 +3973,7 @@ static int rtsp_handle_redirect(rtsp_session_t *session, const char *location) {
   session->session_id[0] = '\0';
   /* Same for metadata: the new server renegotiates every stage from scratch. */
   stream_metadata_forget(rtsp_metadata(session), STREAM_METADATA_STAGE_ALL);
+  rtsp_clear_refplayer_sdp_range(session);
 
   /* Close current connection and remove from poller properly */
   if (session->socket >= 0) {

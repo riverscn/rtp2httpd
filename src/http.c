@@ -23,11 +23,14 @@ static const char *response_codes[] = {
     "HTTP/1.1 401 Unauthorized\r\n",          /* 6 */
     "HTTP/1.1 304 Not Modified\r\n",          /* 7 */
     "HTTP/1.1 204 No Content\r\n",            /* 8 */
+    "HTTP/1.1 405 Method Not Allowed\r\n",    /* 9 */
+    "HTTP/1.1 416 Range Not Satisfiable\r\n", /* 10 */
 };
 
-void send_http_headers(connection_t *c, http_status_t status, const char *content_type, const char *extra_headers) {
+int send_http_headers(connection_t *c, http_status_t status, const char *content_type, const char *extra_headers) {
   char headers[2048];
   int len = 0;
+  int should_clear_cookie = 0;
 
   /* Build complete header in one buffer */
   /* Status line */
@@ -59,7 +62,7 @@ void send_http_headers(connection_t *c, http_status_t status, const char *conten
       len += cookie_len;
     else if (cookie_len < 0)
       logger(LOG_ERROR, "Failed to build Set-Cookie header for r2h-token");
-    c->should_set_r2h_cookie = 0; /* Only set once */
+    should_clear_cookie = 1;
   }
 
   /* CORS header if configured */
@@ -81,8 +84,22 @@ void send_http_headers(connection_t *c, http_status_t status, const char *conten
   if (len >= (int)sizeof(headers))
     len = (int)sizeof(headers) - 1;
 
-  connection_queue_output(c, (const uint8_t *)headers, len);
+  /* This opt-in is used only by deterministic RefPlayer E2E coverage.  It
+   * models the same failure returned by connection_queue_output when the
+   * buffer pool or per-connection queue cannot accept the header. */
+  const char *fail_refplayer_header_queue = getenv("RTP2HTTPD_REFPLAYER_TEST_FAIL_RTSP_HEADER_QUEUE");
+  if (status == STATUS_200 && c && c->stream.rtsp.initialized && c->stream.rtsp.refplayer_timeshift_enabled &&
+      fail_refplayer_header_queue && strcmp(fail_refplayer_header_queue, "1") == 0) {
+    logger(LOG_WARN, "RefPlayer test injection: refusing RTSP HTTP header queue");
+    return -1;
+  }
+
+  if (connection_queue_output(c, (const uint8_t *)headers, len) < 0)
+    return -1;
   c->headers_sent = 1;
+  if (should_clear_cookie)
+    c->should_set_r2h_cookie = 0; /* Only consume after the header is queued. */
+  return 0;
 }
 
 int http_url_decode(char *str) {
@@ -735,6 +752,95 @@ int http_filter_query_param(const char *query_string, const char *exclude_param,
   return (int)out_len;
 }
 
+static int http_private_query_name(const char *name) {
+  return name && (strcasecmp(name, "r2h-token") == 0 || strncasecmp(name, "r2h-refplayer-", 14) == 0);
+}
+
+int http_filter_private_query(const char *query_string, char *output, size_t output_size) {
+  const char *position = query_string;
+  size_t used = 0;
+  int first = 1;
+
+  if (!query_string || !output || output_size == 0)
+    return -1;
+  output[0] = '\0';
+  while (*position) {
+    const char *end = strchr(position, '&');
+    const char *equals;
+    size_t length = end ? (size_t)(end - position) : strlen(position);
+    char name[128];
+    size_t name_length;
+    int is_private;
+
+    if (length == 0)
+      return -1;
+    equals = memchr(position, '=', length);
+    name_length = equals ? (size_t)(equals - position) : length;
+    if (name_length == 0 || name_length >= sizeof(name))
+      return -1;
+    memcpy(name, position, name_length);
+    name[name_length] = '\0';
+    if (http_url_decode(name) != 0)
+      return -1;
+    is_private = http_private_query_name(name);
+    if (!is_private) {
+      if (!first) {
+        if (used + 1 >= output_size)
+          return -1;
+        output[used++] = '&';
+      }
+      if (used + length >= output_size)
+        return -1;
+      memcpy(output + used, position, length);
+      used += length;
+      first = 0;
+    }
+    if (!end)
+      break;
+    position = end + 1;
+  }
+  output[used] = '\0';
+  return (int)used;
+}
+
+int http_redact_private_url(const char *url, char *output, size_t output_size) {
+  const char *query;
+  size_t path_length;
+  char filtered[HTTP_URL_BUFFER_SIZE];
+  int filtered_length;
+
+  if (!url || !output || output_size == 0)
+    return -1;
+  query = strchr(url, '?');
+  if (!query) {
+    if (strlen(url) >= output_size)
+      return -1;
+    snprintf(output, output_size, "%s", url);
+    return (int)strlen(output);
+  }
+  path_length = (size_t)(query - url);
+  if (path_length >= output_size)
+    return -1;
+  memcpy(output, url, path_length);
+  output[path_length] = '\0';
+  static const char control_path[] = "/api/refplayer/v1/rtsp-timeshift";
+  if (path_length >= sizeof(control_path) - 1 &&
+      strncmp(url + path_length - (sizeof(control_path) - 1), control_path, sizeof(control_path) - 1) == 0)
+    return (int)path_length;
+  static const char resolve_path[] = "/api/refplayer/v1/rtsp-timeshift/resolve";
+  if (path_length >= sizeof(resolve_path) - 1 &&
+      strncmp(url + path_length - (sizeof(resolve_path) - 1), resolve_path, sizeof(resolve_path) - 1) == 0)
+    return (int)path_length;
+  filtered_length = http_filter_private_query(query + 1, filtered, sizeof(filtered));
+  if (filtered_length <= 0)
+    return (int)path_length;
+  if (path_length + 1 + (size_t)filtered_length >= output_size)
+    return -1;
+  output[path_length++] = '?';
+  memcpy(output + path_length, filtered, (size_t)filtered_length + 1);
+  return (int)(path_length + (size_t)filtered_length);
+}
+
 /**
  * Send a short error response.  A response to HEAD carries the same headers as
  * the equivalent GET but must not include content (RFC 9110 9.3.2), so the body
@@ -760,6 +866,11 @@ void http_send_404(connection_t *conn) {
   static const char body[] = "<!doctype html><title>404</title>Not Found";
 
   http_send_error(conn, STATUS_404, NULL, body, sizeof(body) - 1);
+}
+
+void http_send_416(connection_t *conn) {
+  static const char body[] = "<!doctype html><title>416</title>Range Not Satisfiable";
+  http_send_error(conn, STATUS_416, NULL, body, sizeof(body) - 1);
 }
 
 void http_send_500(connection_t *conn) {

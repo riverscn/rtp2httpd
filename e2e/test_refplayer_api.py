@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from urllib.parse import urlsplit
 
-from helpers import MockHTTPUpstream, R2HProcess, find_free_port, http_get
+import pytest
+
+from helpers import MockHTTPUpstream, MockRTSPServer, R2HProcess, find_free_port, http_get, http_request, stream_get
+from helpers.rtp import TS_NULL_PACKET
 
 
 _BEGIN_EPOCH = 1704110400  # 2024-01-01 12:00:00 UTC
@@ -81,6 +85,7 @@ rtsp://10.0.0.2/live$SD""",
 
                 for channel in payload["channels"]:
                     assert re.fullmatch(r"[0-9a-f]{32}", channel["id"])
+                    assert channel["client_source_id"] is None
                     assert channel["title"] == "Example News"
                     assert channel["group_title"] == "News"
                     assert channel["live_url"].startswith("http://%s/" % custom_host)
@@ -94,7 +99,7 @@ rtsp://10.0.0.2/live$SD""",
                 )
                 assert status == 200
                 assert json.loads(ready_body) == {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "ready": True,
                     "catalog_channel_count": 3,
                 }
@@ -109,7 +114,7 @@ rtsp://10.0.0.2/live$SD""",
 
     def test_external_playlist_readiness_and_catalog(self, r2h_binary):
         playlist = b"""#EXTM3U
-#EXTINF:-1 group-title="External",External Channel
+#EXTINF:-1 group-title="External" refplayer-source-id="external-must-not-be-trusted",External Channel
 rtp://239.9.9.9:1234
 """
         upstream = MockHTTPUpstream(routes={"/channels.m3u": {"status": 200, "body": playlist}})
@@ -133,10 +138,383 @@ rtp://239.9.9.9:1234
                 assert last_status == 503
                 time.sleep(0.05)
             assert last_status == 200
-            assert _catalog(port)["channels"][0]["title"] == "External Channel"
+            channel = _catalog(port)["channels"][0]
+            assert channel["title"] == "External Channel"
+            assert channel["client_source_id"] is None
         finally:
             process.stop()
             upstream.stop()
+
+
+class TestRefPlayerRTSPTimeshift:
+    def test_header_queue_failure_never_commits_or_publishes_capability(self, r2h_binary):
+        rtsp = MockRTSPServer(
+            num_packets=8,
+            media_payload=TS_NULL_PACKET * 7,
+            play_response_headers=[("Range", "npt=0-600")],
+        )
+        rtsp.start()
+        port = find_free_port()
+        token = "feedfacefeedfacefeedfacefeedface"
+        services = f"""#EXTM3U
+#EXTINF:-1,Header Queue Failure
+rtsp://127.0.0.1:{rtsp.port}/stream
+"""
+        env = os.environ.copy()
+        env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+        env["RTP2HTTPD_REFPLAYER_TEST_FAIL_RTSP_HEADER_QUEUE"] = "1"
+        process = R2HProcess(
+            r2h_binary,
+            port,
+            config_content=_base_config(port, services, global_lines=f"workers = 1\nr2h-token = {token}"),
+            env=env,
+        )
+        try:
+            process.start()
+            channel = _catalog(port, f"/api/refplayer/v1/catalog?r2h-token={token}")["channels"][0]
+            status, _, _ = stream_get(
+                "127.0.0.1", port, _request_path(channel["live_url"]), read_bytes=4096, timeout=15
+            )
+            assert status != 200
+            status, _, body = http_get(
+                "127.0.0.1",
+                port,
+                f"/api/refplayer/v1/rtsp-timeshift?r2h-token={token}&source_id={channel['id']}",
+            )
+            assert status == 200
+            assert json.loads(body)["capability"] is None
+        finally:
+            process.stop()
+            rtsp.stop()
+
+    @pytest.mark.parametrize("packet_count,expects_commit", [(1, False), (8, True)])
+    def test_capability_requires_actual_http_media_commit(self, r2h_binary, packet_count, expects_commit):
+        rtsp = MockRTSPServer(
+            num_packets=packet_count,
+            media_payload=TS_NULL_PACKET * 7,
+            play_response_headers=[("Range", "npt=0-600")],
+        )
+        rtsp.start()
+        port = find_free_port()
+        token = f"{packet_count:032x}"
+        services = f"""#EXTM3U
+#EXTINF:-1,Commit Gate {packet_count}
+rtsp://127.0.0.1:{rtsp.port}/stream
+"""
+        env = os.environ.copy()
+        env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+        process = R2HProcess(
+            r2h_binary,
+            port,
+            config_content=_base_config(port, services, global_lines=f"workers = 1\nr2h-token = {token}"),
+            env=env,
+        )
+        try:
+            process.start()
+            channel = _catalog(port, f"/api/refplayer/v1/catalog?r2h-token={token}")["channels"][0]
+            status, _, _ = stream_get(
+                "127.0.0.1", port, _request_path(channel["live_url"]), read_bytes=4096, timeout=15
+            )
+            assert (status == 200) == expects_commit
+            status, _, body = http_get(
+                "127.0.0.1",
+                port,
+                f"/api/refplayer/v1/rtsp-timeshift?r2h-token={token}&source_id={channel['id']}",
+            )
+            assert status == 200
+            capability = json.loads(body)["capability"]
+            assert (capability is not None) == expects_commit
+        finally:
+            process.stop()
+            rtsp.stop()
+
+    def test_live_discover_resolve_and_archive_play_range(self, r2h_binary):
+        rtsp = MockRTSPServer(
+            num_packets=500,
+            play_response_headers_sequence=[
+                [("Range", "npt=0.000-600.000")],
+                [("Range", "npt=300.000-")],
+            ],
+        )
+        rtsp.start()
+        port = find_free_port()
+        token = "0123456789abcdef0123456789abcdef"
+        services = f"""#EXTM3U
+#EXTINF:-1 refplayer-source-id="11111111111111111111111111111111",Timeshift Channel
+rtsp://127.0.0.1:{rtsp.port}/stream
+"""
+        config = _base_config(
+            port,
+            services,
+            global_lines=f"workers = 1\nr2h-token = {token}",
+        )
+        env = os.environ.copy()
+        env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+        process = R2HProcess(r2h_binary, port, config_content=config, env=env)
+        try:
+            process.start()
+            channel = _catalog(port, f"/api/refplayer/v1/catalog?r2h-token={token}")["channels"][0]
+            live_path = _request_path(channel["live_url"])
+            status, _, body = stream_get("127.0.0.1", port, live_path, read_bytes=4096, timeout=15)
+            assert status == 200
+            assert body
+
+            discover_path = f"/api/refplayer/v1/rtsp-timeshift?r2h-token={token}&source_id={channel['id']}"
+            status, headers, body = http_get("127.0.0.1", port, discover_path)
+            assert status == 200
+            assert headers["Cache-Control"] == "no-store"
+            capability = json.loads(body)["capability"]
+            assert re.fullmatch(r"[0-9a-f]{32}", capability["observation_id"])
+            assert capability["range"] == {
+                "kind": "npt",
+                "start_seconds": 0,
+                "end_seconds": 600,
+            }
+
+            resolve_path = (
+                f"/api/refplayer/v1/rtsp-timeshift/resolve?r2h-token={token}"
+                f"&source_id={channel['id']}&observation_id={capability['observation_id']}"
+                "&kind=npt&target_seconds=300"
+            )
+            status, _, body = http_get("127.0.0.1", port, resolve_path)
+            assert status == 200
+            media_url = json.loads(body)["media_url"]
+            assert urlsplit(media_url).path == urlsplit(channel["live_url"]).path
+
+            status, _, _ = http_get(
+                "127.0.0.1",
+                port,
+                resolve_path.replace("target_seconds=300", "target_seconds=601"),
+            )
+            assert status == 416
+            status, _, _ = http_get(
+                "127.0.0.1",
+                port,
+                discover_path + f"&source_id={channel['id']}",
+            )
+            assert status == 400
+            status, _, _ = http_get(
+                "127.0.0.1",
+                port,
+                discover_path.replace("source_id=", "Source_ID="),
+            )
+            assert status == 400
+
+            status, _, body = stream_get("127.0.0.1", port, _request_path(media_url), read_bytes=4096, timeout=15)
+            assert status == 200
+            assert body
+            play_requests = [request for request in rtsp.requests_detailed if request["method"] == "PLAY"]
+            assert len(play_requests) == 2
+            assert "Range" not in play_requests[0]["headers"]
+            assert play_requests[1]["headers"]["Range"] == "npt=300-"
+            assert all("r2h-refplayer" not in request["uri"].lower() for request in rtsp.requests_detailed)
+            assert all(token not in request["uri"] for request in rtsp.requests_detailed)
+        finally:
+            process.stop()
+            rtsp.stop()
+
+    def test_clock_window_discovers_resolves_and_archives(self, r2h_binary):
+        rtsp = MockRTSPServer(
+            num_packets=500,
+            play_response_headers=[
+                ("Range", "clock=20240101T120000Z-20240101T130000Z"),
+            ],
+        )
+        rtsp.start()
+        port = find_free_port()
+        token = "33333333333333333333333333333333"
+        services = f"""#EXTM3U
+#EXTINF:-1,Clock Window
+rtsp://127.0.0.1:{rtsp.port}/stream
+"""
+        env = os.environ.copy()
+        env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+        process = R2HProcess(
+            r2h_binary,
+            port,
+            config_content=_base_config(port, services, global_lines=f"workers = 1\nr2h-token = {token}"),
+            env=env,
+        )
+        try:
+            process.start()
+            channel = _catalog(port, f"/api/refplayer/v1/catalog?r2h-token={token}")["channels"][0]
+            status, _, body = stream_get(
+                "127.0.0.1", port, _request_path(channel["live_url"]), read_bytes=4096, timeout=15
+            )
+            assert status == 200 and body
+            status, _, body = http_get(
+                "127.0.0.1",
+                port,
+                f"/api/refplayer/v1/rtsp-timeshift?r2h-token={token}&source_id={channel['id']}",
+            )
+            capability = json.loads(body)["capability"]
+            assert status == 200
+            assert capability["range"] == {
+                "kind": "clock",
+                "start_epoch": _BEGIN_EPOCH,
+                "end_epoch": _END_EPOCH,
+            }
+            status, _, body = http_get(
+                "127.0.0.1",
+                port,
+                f"/api/refplayer/v1/rtsp-timeshift/resolve?r2h-token={token}"
+                f"&source_id={channel['id']}&observation_id={capability['observation_id']}"
+                f"&kind=clock&target_epoch={_BEGIN_EPOCH + 1800}",
+            )
+            assert status == 200
+            status, _, body = stream_get(
+                "127.0.0.1",
+                port,
+                _request_path(json.loads(body)["media_url"]),
+                read_bytes=4096,
+                timeout=15,
+            )
+            assert status == 200 and body
+            play_requests = [request for request in rtsp.requests_detailed if request["method"] == "PLAY"]
+            assert play_requests[-1]["headers"]["Range"] == "clock=20240101T123000Z-"
+        finally:
+            process.stop()
+            rtsp.stop()
+
+    def test_finite_sdp_fallback_requires_successful_scale_one_play_and_media(self, r2h_binary):
+        cases = [
+            ([], "a=range:npt=10.000-20.000\r\n", {"kind": "npt", "start_seconds": 10, "end_seconds": 20}),
+            (
+                [("Range", "npt=10.000-")],
+                "a=range:npt=10-20\r\n",
+                {"kind": "npt", "start_seconds": 10, "end_seconds": 20},
+            ),
+            ([("Range", "npt=not-a-time-")], "a=range:npt=10-20\r\n", None),
+            ([], "a=range:npt=10-\r\n", None),
+            ([("Scale", "2")], "a=range:npt=10-20\r\n", None),
+            ([("Scale", "invalid")], "a=range:npt=10-20\r\n", None),
+            (
+                [("Range", "npt=10-20"), ("Range", "npt=11-19")],
+                "a=range:npt=10-20\r\n",
+                None,
+            ),
+        ]
+        for index, (play_headers, range_line, expected) in enumerate(cases):
+            sdp = (
+                "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=T\r\nt=0 0\r\n"
+                "m=video 0 RTP/AVP 33\r\n"
+                f"{range_line}a=control:*\r\n"
+            )
+            rtsp = MockRTSPServer(num_packets=500, custom_sdp=sdp, play_response_headers=play_headers)
+            rtsp.start()
+            port = find_free_port()
+            token = f"{index + 4:032x}"
+            services = f"""#EXTM3U
+#EXTINF:-1,SDP Window {index}
+rtsp://127.0.0.1:{rtsp.port}/stream
+"""
+            env = os.environ.copy()
+            env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+            process = R2HProcess(
+                r2h_binary,
+                port,
+                config_content=_base_config(port, services, global_lines=f"workers = 1\nr2h-token = {token}"),
+                env=env,
+            )
+            try:
+                process.start()
+                channel = _catalog(port, f"/api/refplayer/v1/catalog?r2h-token={token}")["channels"][0]
+                status, _, body = stream_get(
+                    "127.0.0.1", port, _request_path(channel["live_url"]), read_bytes=4096, timeout=15
+                )
+                assert status == 200 and body
+                status, _, body = http_get(
+                    "127.0.0.1",
+                    port,
+                    f"/api/refplayer/v1/rtsp-timeshift?r2h-token={token}&source_id={channel['id']}",
+                )
+                assert status == 200
+                capability = json.loads(body)["capability"]
+                assert (capability and capability["range"]) == expected if expected else capability is None
+            finally:
+                process.stop()
+                rtsp.stop()
+
+    def test_no_window_and_private_query_aliases_fail_closed_without_upstream(self, r2h_binary):
+        rtsp = MockRTSPServer(num_packets=500)
+        rtsp.start()
+        port = find_free_port()
+        token = "22222222222222222222222222222222"
+        services = f"""#EXTM3U
+#EXTINF:-1,No Window
+rtsp://127.0.0.1:{rtsp.port}/stream
+"""
+        config = _base_config(port, services, global_lines=f"workers = 1\nr2h-token = {token}")
+        env = os.environ.copy()
+        env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+        process = R2HProcess(r2h_binary, port, config_content=config, capture_log=True, env=env)
+        try:
+            process.start()
+            channel = _catalog(port, f"/api/refplayer/v1/catalog?r2h-token={token}")["channels"][0]
+            status, _, body = stream_get(
+                "127.0.0.1", port, _request_path(channel["live_url"]), read_bytes=4096, timeout=15
+            )
+            assert status == 200 and body
+            status, _, body = http_get(
+                "127.0.0.1",
+                port,
+                f"/api/refplayer/v1/rtsp-timeshift?r2h-token={token}&source_id={channel['id']}",
+            )
+            assert status == 200
+            assert json.loads(body)["capability"] is None
+
+            baseline = len(rtsp.requests_received)
+            encoded_name = "%72%32%68-refplayer-rtsp-source"
+            status, _, _ = http_request(
+                "127.0.0.1",
+                port,
+                "GET",
+                _request_path(channel["live_url"]) + f"&{encoded_name}={'a' * 32}",
+            )
+            assert status == 400
+            long_name = "r2h-refplayer-rtsp-source" + ("x" * 160)
+            status, _, _ = http_request(
+                "127.0.0.1",
+                port,
+                "GET",
+                _request_path(channel["live_url"]) + f"&{long_name}=value",
+            )
+            assert status == 400
+            assert len(rtsp.requests_received) == baseline
+
+            observation = "abcdefabcdefabcdefabcdefabcdefab"
+            target = "123456789"
+            http_get(
+                "127.0.0.1",
+                port,
+                f"/api/refplayer/v1/rtsp-timeshift/resolve?r2h-token={token}"
+                f"&source_id={channel['id']}&observation_id={observation}"
+                f"&kind=clock&target_epoch={target}",
+            )
+            time.sleep(0.05)
+            log = process.read_log()
+            assert token not in log
+            assert observation not in log
+            assert target not in log
+        finally:
+            process.stop()
+            rtsp.stop()
+
+    def test_private_inline_snapshot_round_trips_client_source_id(self, r2h_binary):
+        client_source_id = "0123456789abcdef0123456789abcdef"
+        port = find_free_port()
+        services = f"""#EXTM3U
+#EXTINF:-1 refplayer-source-id="{client_source_id}",refplayer-rtsp
+rtsp://127.0.0.1:9/live
+"""
+        process = R2HProcess(r2h_binary, port, config_content=_base_config(port, services))
+        try:
+            process.start()
+            channel = _catalog(port)["channels"][0]
+            assert channel["client_source_id"] == client_source_id
+            assert channel["id"] != client_source_id
+        finally:
+            process.stop()
 
 
 class TestRefPlayerCatchup:
@@ -174,7 +552,9 @@ rtp://239.1.1.3:1234
 
             paths = [request["path"] for request in upstream.requests_log]
             assert "/path/20240101120000/20240101130000/stream.ts" in paths
-            assert any(path.startswith("/query?") and "playseek=20240101120000-20240101130000" in path for path in paths)
+            assert any(
+                path.startswith("/query?") and "playseek=20240101120000-20240101130000" in path for path in paths
+            )
             assert any(
                 path.startswith("/offset?")
                 and "starttime=20240101T130000" in path
@@ -197,16 +577,13 @@ rtp://239.1.1.1:1234
             catchup_url = _catalog(port)["channels"][0]["catchup"]["url"]
             catchup_path = _request_path(catchup_url)
 
-            status, _, _ = http_get(
-                "127.0.0.1", port, catchup_path + "&r2h-refplayer-start=%d" % _BEGIN_EPOCH
-            )
+            status, _, _ = http_get("127.0.0.1", port, catchup_path + "&r2h-refplayer-start=%d" % _BEGIN_EPOCH)
             assert status == 400
 
             status, _, _ = http_get(
                 "127.0.0.1",
                 port,
-                catchup_path
-                + "&r2h-refplayer-start=%d&r2h-refplayer-end=%d" % (_END_EPOCH, _BEGIN_EPOCH),
+                catchup_path + "&r2h-refplayer-start=%d&r2h-refplayer-end=%d" % (_END_EPOCH, _BEGIN_EPOCH),
             )
             assert status == 400
 
@@ -214,8 +591,7 @@ rtp://239.1.1.1:1234
             status, _, _ = http_get(
                 "127.0.0.1",
                 port,
-                stale_path
-                + "&r2h-refplayer-start=%d&r2h-refplayer-end=%d" % (_BEGIN_EPOCH, _END_EPOCH),
+                stale_path + "&r2h-refplayer-start=%d&r2h-refplayer-end=%d" % (_BEGIN_EPOCH, _END_EPOCH),
             )
             assert status == 404
         finally:
