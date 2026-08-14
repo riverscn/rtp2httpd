@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
+from helpers import R2HProcess, find_free_port, http_get
 
 _CATALOG_MAGIC = "RTP2HTTPD-REFPLAYER-CATALOG/1"
 _RESOLVE_MAGIC = "RTP2HTTPD-REFPLAYER-RESOLVE/1"
@@ -64,9 +66,10 @@ https://edge.example.test/news-low.m3u8$SD
     )
 
     assert returncode == 0
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["mode"] == "direct"
     assert payload["reason"] is None
+    assert payload["proxy_m3u"] is None
     assert payload["epg_url"] == "https://iptv.example.test/app/guide/epg.xml"
 
     channels = {channel["title"]: channel for channel in payload["channels"]}
@@ -79,6 +82,8 @@ https://edge.example.test/news-low.m3u8$SD
     assert [source["label"] for source in news["sources"]] == ["HD", "SD"]
     assert news["sources"][0]["live_url"] == "https://iptv.example.test/live/news.m3u8?token=live-token"
     assert news["sources"][1]["live_url"] == "https://edge.example.test/news-low.m3u8"
+    assert news["sources"][0]["live_route"] == "direct"
+    assert news["sources"][0]["catchup_route"] == "direct"
     assert news["sources"][0]["catchup"] == {
         "source_id": news["sources"][0]["id"],
         "mode": "default",
@@ -100,18 +105,20 @@ https://edge.example.test/news-low.m3u8$SD
     )
     assert returncode == 0
     assert resolved == {
-        "schema_version": 1,
+        "schema_version": 2,
         "source_id": source_id,
         "url": ("https://iptv.example.test/app/archive/$HD-20240101210000/20240101220000.m3u8?key=archive-token"),
     }
 
 
-def test_proxy_capability_is_based_on_effective_live_and_catchup_urls(r2h_binary):
+def test_native_rtp_udp_rtsp_live_stay_direct_and_only_rtsp_catchup_uses_helper(r2h_binary):
     base_url = "http://iptv.example.test/playlist.m3u"
     raw_live = """\
 #EXTM3U
 #EXTINF:-1,Raw Multicast
 rtp://239.1.1.1:1234
+#EXTINF:-1,Raw UDP
+udp://239.1.1.2:1234
 """
     returncode, payload = _run(
         r2h_binary,
@@ -119,8 +126,83 @@ rtp://239.1.1.1:1234
         _catalog_frame(base_url, raw_live),
     )
     assert returncode == 0
-    assert payload["mode"] == "requires_proxy"
-    assert payload["reason"] == "live_source_requires_proxy"
+    assert payload["mode"] == "direct"
+    assert payload["reason"] is None
+    assert payload["proxy_m3u"] is None
+    assert [channel["sources"][0]["live_url"] for channel in payload["channels"]] == [
+        "rtp://239.1.1.1:1234",
+        "udp://239.1.1.2:1234",
+    ]
+    assert [channel["sources"][0]["live_route"] for channel in payload["channels"]] == ["direct", "direct"]
+
+    native_catchup = """\
+#EXTM3U
+#EXTINF:-1 catchup-source="udp://239.1.1.3:1234?start=${(b)timestamp}",Native Catchup
+rtp://239.1.1.1:1234
+"""
+    returncode, payload = _run(
+        r2h_binary,
+        "--refplayer-direct-catalog",
+        _catalog_frame(base_url, native_catchup),
+    )
+    assert returncode == 0
+    assert payload["mode"] == "direct"
+    source = payload["channels"][0]["sources"][0]
+    assert source["live_route"] == "direct"
+    assert source["catchup_route"] == "direct"
+    returncode, resolved = _run(
+        r2h_binary,
+        "--refplayer-direct-resolve",
+        _resolve_frame(base_url, source["id"], native_catchup),
+    )
+    assert returncode == 0
+    assert resolved["url"] == "udp://239.1.1.3:1234?start=%d" % _BEGIN_EPOCH
+
+    raw_rtsp = """\
+#EXTM3U
+#EXTINF:-1,RTSP Needs Probe
+rtsp://iptv.example.test/live
+"""
+    returncode, payload = _run(
+        r2h_binary,
+        "--refplayer-direct-catalog",
+        _catalog_frame(base_url, raw_rtsp),
+    )
+    assert returncode == 0
+    assert payload["mode"] == "direct"
+    assert payload["reason"] is None
+    source = payload["channels"][0]["sources"][0]
+    assert source["live_url"] == "rtsp://iptv.example.test/live"
+    assert source["live_route"] == "direct"
+    assert source["catchup_route"] is None
+    assert payload["proxy_m3u"] is None
+
+    rtsp_append_catchup = """\
+#EXTM3U
+#EXTINF:-1 catchup="append" catchup-source="?playseek=${(b)timestamp}-${(e)timestamp}",RTSP Append
+rtsp://iptv.example.test/live
+"""
+    returncode, payload = _run(
+        r2h_binary,
+        "--refplayer-direct-catalog",
+        _catalog_frame(base_url, rtsp_append_catchup),
+    )
+    assert returncode == 0
+    source = payload["channels"][0]["sources"][0]
+    assert source["live_route"] == "direct"
+    assert source["catchup_route"] == "rtsp_helper_candidate"
+    assert payload["proxy_m3u"] == (
+        '#EXTM3U\n#EXTINF:-1 refplayer-source-id="%s" catchup="default" '
+        'catchup-source="rtsp://iptv.example.test/live?playseek=${(b)timestamp}-${(e)timestamp}",refplayer-rtsp\n'
+        "rtsp://iptv.example.test/live?playseek=${(b)timestamp}-${(e)timestamp}\n" % source["id"]
+    )
+    returncode, resolved = _run(
+        r2h_binary,
+        "--refplayer-direct-resolve",
+        _resolve_frame(base_url, source["id"], rtsp_append_catchup),
+    )
+    assert returncode == 65
+    assert resolved["error"]["code"] == "resolve_failed"
 
     raw_catchup = """\
 #EXTM3U
@@ -133,8 +215,21 @@ https://media.example.test/live.m3u8
         _catalog_frame(base_url, raw_catchup),
     )
     assert returncode == 0
-    assert payload["mode"] == "requires_proxy"
-    assert payload["reason"] == "catchup_source_requires_proxy"
+    assert payload["mode"] == "mixed"
+    assert payload["reason"] == "catchup_source_rtsp_candidate"
+    source = payload["channels"][0]["sources"][0]
+    assert source["live_route"] == "direct"
+    assert source["catchup_route"] == "rtsp_helper_candidate"
+    assert source["catchup"] == {
+        "source_id": source["id"],
+        "mode": "default",
+        "retention_seconds": None,
+    }
+    assert payload["proxy_m3u"] == (
+        '#EXTM3U\n#EXTINF:-1 refplayer-source-id="%s" catchup="default" '
+        'catchup-source="rtsp://archive.example.test/replay/${(b)timestamp}",refplayer-rtsp\n'
+        "rtsp://archive.example.test/replay/${(b)timestamp}\n" % source["id"]
+    )
 
     invalid_catchup = """\
 #EXTM3U
@@ -149,6 +244,79 @@ https://media.example.test/live.m3u8
     assert returncode == 0
     assert payload["mode"] == "direct"
     assert payload["channels"][0]["sources"][0]["catchup"] is None
+
+
+def test_proxy_snapshot_does_not_copy_untrusted_metadata_or_accept_m3u_delimiters_in_rtsp_urls(r2h_binary):
+    playlist = """\
+#EXTM3U
+#EXTINF:-1 group-title="Injected\\\" attribute=\\\"value" source-label="also-untrusted",Injected Title \\" \\\\x
+rtsp://iptv.example.test/live
+#EXTINF:-1,Bad Quote URL
+rtsp://iptv.example.test/live"injected
+#EXTINF:-1,Bad Backslash URL
+rtsp://iptv.example.test/live\\injected
+#EXTINF:-1,Direct Survivor
+https://media.example.test/live.m3u8
+"""
+    returncode, payload = _run(
+        r2h_binary,
+        "--refplayer-direct-catalog",
+        _catalog_frame("https://iptv.example.test/playlist.m3u", playlist),
+    )
+
+    assert returncode == 0
+    candidate_sources = [
+        source
+        for channel in payload["channels"]
+        for source in channel["sources"]
+        if source["catchup_route"] == "rtsp_helper_candidate"
+    ]
+    assert candidate_sources == []
+    assert payload["proxy_m3u"] is None
+
+
+def test_mixed_http_live_rtsp_catchup_snapshot_round_trips_source_id(r2h_binary):
+    """The Host can embed the opaque snapshot without parsing or rewriting M3U."""
+    playlist = """\
+#EXTM3U
+#EXTINF:-1 catchup-source="rtsp://archive.example.test/replay/${(b)timestamp}",HTTP Live
+https://media.example.test/live.m3u8
+"""
+    returncode, direct = _run(
+        r2h_binary,
+        "--refplayer-direct-catalog",
+        _catalog_frame("https://iptv.example.test/playlist.m3u", playlist),
+    )
+    assert returncode == 0
+    source = direct["channels"][0]["sources"][0]
+    assert source["live_route"] == "direct"
+    assert source["catchup_route"] == "rtsp_helper_candidate"
+
+    port = find_free_port()
+    config = f"""\
+[global]
+verbosity = 4
+maxclients = 10
+
+[bind]
+* {port}
+
+[services]
+{direct["proxy_m3u"]}"""
+    process = R2HProcess(r2h_binary, port, config_content=config)
+    try:
+        process.start()
+        status, _, body = http_get("127.0.0.1", port, "/api/refplayer/v1/catalog")
+        assert status == 200, body.decode(errors="replace")
+        server = json.loads(body)
+        assert server["schema_version"] == 2
+        assert len(server["channels"]) == 1
+        candidate = server["channels"][0]
+        assert candidate["client_source_id"] == source["id"]
+        assert candidate["catchup"] is not None
+        assert "r2h-refplayer-source=" in candidate["catchup"]["url"]
+    finally:
+        process.stop()
 
 
 def test_append_catchup_is_resolved_with_the_shared_url_template_engine(r2h_binary):

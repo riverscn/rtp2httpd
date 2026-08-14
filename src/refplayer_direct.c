@@ -38,7 +38,8 @@ enum direct_exit_code_e {
 
 typedef enum {
   DIRECT_URL_HTTP = 0,
-  DIRECT_URL_REQUIRES_PROXY,
+  DIRECT_URL_NATIVE,
+  DIRECT_URL_RTSP_CANDIDATE,
   DIRECT_URL_INVALID,
 } direct_url_kind_t;
 
@@ -51,8 +52,10 @@ typedef struct direct_source_s {
   char id[DIRECT_ID_SIZE];
   char *label;
   char *live_url;
+  direct_url_kind_t live_kind;
   char *catchup_template;
   char *catchup_mode;
+  direct_url_kind_t catchup_kind;
   double catchup_retention_seconds;
   struct direct_source_s *next;
 } direct_source_t;
@@ -75,8 +78,8 @@ typedef struct {
   direct_channel_t *channels_tail;
   size_t channel_count;
   size_t source_count;
-  int requires_proxy;
-  const char *requires_proxy_reason;
+  int has_rtsp_candidates;
+  const char *rtsp_candidate_reason;
 } direct_catalog_t;
 
 typedef struct {
@@ -112,6 +115,10 @@ typedef struct {
   char catchup_source[DIRECT_MAX_URL];
   double catchup_retention_seconds;
 } direct_defaults_t;
+
+static int direct_json_append_proxy_m3u(direct_json_t *json, const direct_catalog_t *catalog);
+
+static int direct_url_has_unsafe_byte(const char *url);
 
 static void direct_group_free(direct_group_t *group) {
   while (group) {
@@ -179,7 +186,7 @@ static int direct_error(int exit_code, const char *code, const char *message) {
     size_t needed = strlen(escaped_code) + strlen(escaped_message) + 80;
     json.data = malloc(needed);
     if (json.data) {
-      snprintf(json.data, needed, "{\"schema_version\":1,\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}", escaped_code,
+      snprintf(json.data, needed, "{\"schema_version\":2,\"error\":{\"code\":\"%s\",\"message\":\"%s\"}}", escaped_code,
                escaped_message);
       (void)direct_write_json(json.data);
     }
@@ -402,9 +409,53 @@ static int direct_is_http_url(const char *url) {
   return url && (strncasecmp(url, "http://", 7) == 0 || strncasecmp(url, "https://", 8) == 0);
 }
 
-static int direct_is_raw_proxy_url(const char *url) {
-  return url && (strncasecmp(url, "rtp://", 6) == 0 || strncasecmp(url, "udp://", 6) == 0 ||
-                 strncasecmp(url, "rtsp://", 7) == 0);
+static int direct_is_native_url(const char *url) {
+  return url && (strncasecmp(url, "rtp://", 6) == 0 || strncasecmp(url, "udp://", 6) == 0);
+}
+
+static int direct_is_rtsp_url(const char *url) { return url && strncasecmp(url, "rtsp://", 7) == 0; }
+
+static int direct_validate_absolute_rtsp_url(const char *url) {
+  const char *authority;
+  const char *authority_end;
+  const char *port = NULL;
+
+  /* The URL is later embedded in a private synthetic M3U/config snapshot.
+   * Reject delimiter bytes instead of trying to apply JSON escaping to an M3U
+   * grammar; this keeps the snapshot a single opaque service entry. */
+  if (!direct_is_rtsp_url(url) || direct_url_has_unsafe_byte(url) || strpbrk(url, "\"\\") != NULL)
+    return -1;
+  authority = url + 7;
+  authority_end = strpbrk(authority, "/?#");
+  if (!authority_end)
+    authority_end = authority + strlen(authority);
+  if (authority_end == authority || memchr(authority, '@', (size_t)(authority_end - authority)))
+    return -1;
+  if (*authority == '[') {
+    const char *bracket = memchr(authority, ']', (size_t)(authority_end - authority));
+    if (!bracket || bracket == authority + 1)
+      return -1;
+    if (bracket + 1 < authority_end) {
+      if (bracket[1] != ':')
+        return -1;
+      port = bracket + 2;
+    }
+  } else {
+    const char *colon = memchr(authority, ':', (size_t)(authority_end - authority));
+    if (colon) {
+      if (colon == authority || memchr(colon + 1, ':', (size_t)(authority_end - colon - 1)))
+        return -1;
+      port = colon + 1;
+    }
+  }
+  if (port) {
+    if (port == authority_end)
+      return -1;
+    for (const char *digit = port; digit < authority_end; digit++)
+      if (!isdigit((unsigned char)*digit))
+        return -1;
+  }
+  return 0;
 }
 
 static int direct_validate_absolute_http_url(const char *url) {
@@ -603,8 +654,15 @@ static direct_url_kind_t direct_resolve_url(const char *reference, const char *b
   if (!reference || !reference[0] || direct_url_has_unsafe_byte(reference))
     return DIRECT_URL_INVALID;
 
-  if (direct_is_raw_proxy_url(reference))
-    return DIRECT_URL_REQUIRES_PROXY;
+  if (direct_is_native_url(reference) || direct_is_rtsp_url(reference)) {
+    if (direct_is_rtsp_url(reference) && direct_validate_absolute_rtsp_url(reference) != 0)
+      return DIRECT_URL_INVALID;
+    if (output)
+      *output = strdup(reference);
+    if (output && !*output)
+      return DIRECT_URL_INVALID;
+    return direct_is_rtsp_url(reference) ? DIRECT_URL_RTSP_CANDIDATE : DIRECT_URL_NATIVE;
+  }
   if (direct_is_http_url(reference)) {
     if (direct_normalize_absolute_http_url(reference, normalized, sizeof(normalized)) != 0)
       return DIRECT_URL_INVALID;
@@ -886,6 +944,7 @@ static int direct_add_source(direct_catalog_t *catalog, direct_channel_t *channe
   direct_url_kind_t live_kind;
   char *live_url = NULL;
   char *catchup_template = NULL;
+  direct_url_kind_t catchup_kind = DIRECT_URL_INVALID;
   const char *catchup_mode = extinf->catchup_mode[0] ? extinf->catchup_mode : "default";
   int has_declared_catchup = extinf->catchup_source[0] != '\0';
   char base_source_id[DIRECT_ID_SIZE];
@@ -893,33 +952,33 @@ static int direct_add_source(direct_catalog_t *catalog, direct_channel_t *channe
   live_kind = direct_resolve_url(raw_live_url, base_url, &live_url);
   if (live_kind == DIRECT_URL_INVALID)
     return 0;
-  if (live_kind == DIRECT_URL_REQUIRES_PROXY) {
-    catalog->requires_proxy = 1;
-    if (!catalog->requires_proxy_reason)
-      catalog->requires_proxy_reason = "live_source_requires_proxy";
-    live_url = strdup(raw_live_url);
-    if (!live_url)
-      return -1;
-  }
-
   if (has_declared_catchup) {
-    direct_url_kind_t catchup_kind;
-    if (direct_is_raw_proxy_url(extinf->catchup_source)) {
-      catchup_kind = DIRECT_URL_REQUIRES_PROXY;
+    if (direct_is_rtsp_url(extinf->catchup_source)) {
+      if (direct_validate_absolute_rtsp_url(extinf->catchup_source) == 0) {
+        catchup_template = strdup(extinf->catchup_source);
+        catchup_kind = catchup_template ? DIRECT_URL_RTSP_CANDIDATE : DIRECT_URL_INVALID;
+      }
+    } else if (direct_is_native_url(extinf->catchup_source)) {
+      catchup_template = strdup(extinf->catchup_source);
+      catchup_kind = catchup_template ? DIRECT_URL_NATIVE : DIRECT_URL_INVALID;
     } else if (strcmp(catchup_mode, "append") == 0) {
       catchup_template = direct_append_catchup(live_url, extinf->catchup_source);
-      catchup_kind = catchup_template && direct_validate_absolute_http_url(catchup_template) == 0 ? DIRECT_URL_HTTP
-                                                                                                  : DIRECT_URL_INVALID;
+      if (catchup_template && direct_validate_absolute_http_url(catchup_template) == 0) {
+        catchup_kind = DIRECT_URL_HTTP;
+      } else if (catchup_template && direct_validate_absolute_rtsp_url(catchup_template) == 0) {
+        catchup_kind = DIRECT_URL_RTSP_CANDIDATE;
+      } else if (catchup_template && direct_is_native_url(catchup_template) &&
+                 !direct_url_has_unsafe_byte(catchup_template)) {
+        catchup_kind = DIRECT_URL_NATIVE;
+      }
     } else {
       catchup_kind = direct_resolve_url(extinf->catchup_source, base_url, &catchup_template);
     }
 
-    if (catchup_kind == DIRECT_URL_REQUIRES_PROXY) {
-      catalog->requires_proxy = 1;
-      if (!catalog->requires_proxy_reason)
-        catalog->requires_proxy_reason = "catchup_source_requires_proxy";
-      free(catchup_template);
-      catchup_template = NULL;
+    if (catchup_kind == DIRECT_URL_RTSP_CANDIDATE) {
+      catalog->has_rtsp_candidates = 1;
+      if (!catalog->rtsp_candidate_reason)
+        catalog->rtsp_candidate_reason = "catchup_source_rtsp_candidate";
     } else if (catchup_kind == DIRECT_URL_INVALID) {
       free(catchup_template);
       catchup_template = NULL;
@@ -934,8 +993,10 @@ static int direct_add_source(direct_catalog_t *catalog, direct_channel_t *channe
   }
   source->label = direct_optional_duplicate(label);
   source->live_url = live_url;
+  source->live_kind = live_kind;
   source->catchup_template = catchup_template;
   source->catchup_mode = catchup_template ? strdup(catchup_mode) : NULL;
+  source->catchup_kind = catchup_kind;
   source->catchup_retention_seconds = extinf->catchup_retention_seconds;
   if ((label && label[0] && !source->label) || (catchup_template && !source->catchup_mode)) {
     free(source->label);
@@ -1126,12 +1187,15 @@ static int direct_catalog_json(const direct_catalog_t *catalog, direct_json_t *j
       return -1;                                                                                                       \
   } while (0)
 
-  DIRECT_APPEND("{\"schema_version\":1,\"helper_version\":\"");
+  DIRECT_APPEND("{\"schema_version\":2,\"helper_version\":\"");
   DIRECT_ESCAPE(VERSION);
   DIRECT_APPEND("\",\"mode\":\"");
-  DIRECT_APPEND(catalog->requires_proxy ? "requires_proxy" : "direct");
+  DIRECT_APPEND(catalog->has_rtsp_candidates ? "mixed" : "direct");
   DIRECT_APPEND("\",\"reason\":");
-  if (direct_json_optional_string(json, catalog->requires_proxy_reason) != 0)
+  if (direct_json_optional_string(json, catalog->rtsp_candidate_reason) != 0)
+    return -1;
+  DIRECT_APPEND(",\"proxy_m3u\":");
+  if (direct_json_append_proxy_m3u(json, catalog) != 0)
     return -1;
   DIRECT_APPEND(",\"epg_url\":");
   if (direct_json_optional_string(json, catalog->epg_url) != 0)
@@ -1181,14 +1245,24 @@ static int direct_catalog_json(const direct_catalog_t *catalog, direct_json_t *j
         return -1;
       DIRECT_APPEND(",\"live_url\":\"");
       DIRECT_ESCAPE(source->live_url);
-      DIRECT_APPEND("\",\"catchup\":");
-      if (!source->catchup_template) {
+      DIRECT_APPEND("\",\"live_route\":\"");
+      DIRECT_APPEND("direct");
+      DIRECT_APPEND("\",\"catchup_route\":");
+      if (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE) {
+        DIRECT_APPEND("\"rtsp_helper_candidate\"");
+      } else if (source->catchup_template) {
+        DIRECT_APPEND("\"direct\"");
+      } else {
+        DIRECT_APPEND("null");
+      }
+      DIRECT_APPEND(",\"catchup\":");
+      if (!source->catchup_template && source->catchup_kind != DIRECT_URL_RTSP_CANDIDATE) {
         DIRECT_APPEND("null");
       } else {
         DIRECT_APPEND("{\"source_id\":\"");
         DIRECT_ESCAPE(source->id);
         DIRECT_APPEND("\",\"mode\":\"");
-        DIRECT_ESCAPE(source->catchup_mode);
+        DIRECT_ESCAPE(source->catchup_mode ? source->catchup_mode : "default");
         DIRECT_APPEND("\",\"retention_seconds\":");
         if (source->catchup_retention_seconds > 0) {
           int written = snprintf(retention, sizeof(retention), "%.17g", source->catchup_retention_seconds);
@@ -1209,6 +1283,61 @@ static int direct_catalog_json(const direct_catalog_t *catalog, direct_json_t *j
 #undef DIRECT_APPEND
 #undef DIRECT_ESCAPE
   return 0;
+}
+
+static int direct_proxy_m3u_append_extinf(direct_json_t *json, const direct_source_t *source) {
+  if (direct_json_append(json, "#EXTINF:-1 refplayer-source-id=\\\"") != 0 ||
+      direct_json_escape(json, source->id) != 0 || direct_json_append(json, "\\\"") != 0)
+    return -1;
+  if (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE) {
+    /* The Host uses this only as a private routing snapshot. Do not copy the
+     * playlist's untrusted catchup-mode token into config/M3U syntax. */
+    if (direct_json_append(json, " catchup=\\\"default\\\" catchup-source=\\\"") != 0 ||
+        direct_json_escape(json, source->catchup_template) != 0 || direct_json_append(json, "\\\"") != 0)
+      return -1;
+    if (source->catchup_retention_seconds > 0) {
+      char retention_days[64];
+      int written = snprintf(retention_days, sizeof(retention_days), "%.17g",
+                             source->catchup_retention_seconds / 86400.0);
+      if (written < 0 || (size_t)written >= sizeof(retention_days) ||
+          direct_json_append(json, " catchup-days=\\\"") != 0 || direct_json_append(json, retention_days) != 0 ||
+          direct_json_append(json, "\\\"") != 0)
+        return -1;
+    }
+  }
+  /* Server-side metadata is discarded by the Host. Use only the validated
+   * opaque ID here so playlist titles/groups cannot become M3U or config
+   * syntax when the snapshot is embedded in the helper's private config. */
+  return direct_json_append(json, ",refplayer-rtsp\\n");
+}
+
+static int direct_json_append_proxy_m3u(direct_json_t *json, const direct_catalog_t *catalog) {
+  int has_candidate = 0;
+
+  for (const direct_channel_t *channel = catalog->channels; channel; channel = channel->next)
+    for (const direct_source_t *source = channel->sources; source; source = source->next)
+      if (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE)
+        has_candidate = 1;
+  if (!has_candidate)
+    return direct_json_append(json, "null");
+  if (direct_json_append(json, "\"#EXTM3U\\n") != 0)
+    return -1;
+
+  for (const direct_channel_t *channel = catalog->channels; channel; channel = channel->next) {
+    for (const direct_source_t *source = channel->sources; source; source = source->next) {
+      const char *proxy_live_url;
+      if (source->catchup_kind != DIRECT_URL_RTSP_CANDIDATE)
+        continue;
+      proxy_live_url = source->catchup_template;
+      if (!proxy_live_url || direct_validate_absolute_rtsp_url(proxy_live_url) != 0 ||
+          (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE &&
+           (!source->catchup_template || direct_validate_absolute_rtsp_url(source->catchup_template) != 0)) ||
+          direct_proxy_m3u_append_extinf(json, source) != 0 || direct_json_escape(json, proxy_live_url) != 0 ||
+          direct_json_append(json, "\\n") != 0)
+        return -1;
+    }
+  }
+  return direct_json_append(json, "\"");
 }
 
 static direct_source_t *direct_find_source(direct_catalog_t *catalog, const char *source_id) {
@@ -1409,14 +1538,18 @@ static int direct_run_resolve(direct_frame_t *frame) {
   if (direct_strip_seek_controls(template, &begin_offset_seconds, &end_offset_seconds) != 0 ||
       direct_fill_seek_context(frame, begin_offset_seconds, end_offset_seconds, &context) != 0 ||
       url_template_resolve(template, &context, resolved, sizeof(resolved)) != 0 ||
-      direct_validate_absolute_http_url(resolved) != 0 || strpbrk(resolved, "{}") != NULL) {
+      ((source->catchup_kind == DIRECT_URL_HTTP && direct_validate_absolute_http_url(resolved) != 0) ||
+       (source->catchup_kind == DIRECT_URL_NATIVE &&
+        (!direct_is_native_url(resolved) || direct_url_has_unsafe_byte(resolved))) ||
+       (source->catchup_kind != DIRECT_URL_HTTP && source->catchup_kind != DIRECT_URL_NATIVE)) ||
+      strpbrk(resolved, "{}") != NULL) {
     free(template);
     direct_catalog_free(&catalog);
     return direct_error(DIRECT_EXIT_DATA, "resolve_failed", "The catch-up URL template could not be resolved.");
   }
   free(template);
 
-  if (direct_json_append(&json, "{\"schema_version\":1,\"source_id\":\"") != 0 ||
+  if (direct_json_append(&json, "{\"schema_version\":2,\"source_id\":\"") != 0 ||
       direct_json_escape(&json, source->id) != 0 || direct_json_append(&json, "\",\"url\":\"") != 0 ||
       direct_json_escape(&json, resolved) != 0 || direct_json_append(&json, "\"}") != 0) {
     direct_catalog_free(&catalog);

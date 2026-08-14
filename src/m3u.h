@@ -13,6 +13,10 @@ typedef struct m3u_catalog_channel_s {
   char id[M3U_CATALOG_ID_SIZE];
   char *title;
   char *group_title;
+  /* Opaque RefPlayer source identity supplied only by an inline helper
+   * configuration. It maps a confirmed RTSP source back to the one-shot
+   * catalog without overloading the helper's own routing/catch-up ID. */
+  char *client_source_id;
   char *service_name;
   char *catchup_service_name;
   double catchup_retention_seconds;
@@ -136,7 +140,6 @@ char *m3u_generate_refplayer_catalog(const char *host_header, const char *x_forw
 
 /* Resolve opaque source IDs used by the RefPlayer catalog. */
 const m3u_catalog_channel_t *m3u_catalog_find_source(const char *source_id);
-
 /* True once the configured external M3U has completed its first successful
  * parse, or immediately when no external M3U is configured. */
 int m3u_refplayer_is_ready(void);

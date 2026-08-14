@@ -74,7 +74,7 @@ rtsp://10.0.0.2/live$SD""",
                     "/api/refplayer/v1/catalog?r2h-token=native-secret",
                     headers={"Host": custom_host},
                 )
-                assert payload["schema_version"] == 1
+                assert payload["schema_version"] == 2
                 assert isinstance(payload["helper_version"], str) and payload["helper_version"]
                 assert len(payload["channels"]) == 3
                 assert len({channel["id"] for channel in payload["channels"]}) == 3

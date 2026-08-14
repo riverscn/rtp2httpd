@@ -22,6 +22,7 @@
 #define MAX_M3U_LINE 4096
 #define MAX_SERVICE_NAME 256
 #define MAX_URL_LENGTH 2048
+#define MAX_CLIENT_SOURCE_ID 256
 #define MAX_M3U_CONTENT (10 * 1024 * 1024) /* 10MB max */
 #define M3U_BASE_URL_PLACEHOLDER "{BASE_URL}"
 
@@ -30,6 +31,7 @@ struct m3u_extinf {
   char title[MAX_SERVICE_NAME];
   char name[MAX_SERVICE_NAME];
   char group_title[MAX_SERVICE_NAME];
+  char client_source_id[MAX_CLIENT_SOURCE_ID + 1];
   char catchup_source[MAX_URL_LENGTH];
   double catchup_retention_seconds;
   int has_catchup;
@@ -47,6 +49,7 @@ static void catalog_free_channel_list(m3u_catalog_channel_t *channel) {
     m3u_catalog_channel_t *next = channel->next;
     free(channel->title);
     free(channel->group_title);
+    free(channel->client_source_id);
     free(channel->service_name);
     free(channel->catchup_service_name);
     free(channel);
@@ -111,10 +114,15 @@ static int catalog_add_channel(const struct m3u_extinf *extinf, const char *serv
     return -1;
   channel->title = strdup(extinf->title);
   channel->group_title = extinf->group_title[0] ? strdup(extinf->group_title) : NULL;
+  channel->client_source_id = source_kind == SERVICE_SOURCE_INLINE && extinf->client_source_id[0]
+                                  ? strdup(extinf->client_source_id)
+                                  : NULL;
   channel->service_name = strdup(service_name);
   channel->catchup_service_name = catchup_service_name ? strdup(catchup_service_name) : NULL;
   channel->catchup_retention_seconds = extinf->catchup_retention_seconds;
-  if (!channel->title || (extinf->group_title[0] && !channel->group_title) || !channel->service_name ||
+  if (!channel->title || (extinf->group_title[0] && !channel->group_title) ||
+      (source_kind == SERVICE_SOURCE_INLINE && extinf->client_source_id[0] && !channel->client_source_id) ||
+      !channel->service_name ||
       (catchup_service_name && !channel->catchup_service_name)) {
     catalog_free_channel_list(channel);
     return -1;
@@ -1048,10 +1056,12 @@ static int catalog_clone_cache(const m3u_cache_t *source, m3u_cache_t *destinati
     copy->catchup_retention_seconds = channel->catchup_retention_seconds;
     copy->title = channel->title ? strdup(channel->title) : NULL;
     copy->group_title = channel->group_title ? strdup(channel->group_title) : NULL;
+    copy->client_source_id = channel->client_source_id ? strdup(channel->client_source_id) : NULL;
     copy->service_name = channel->service_name ? strdup(channel->service_name) : NULL;
     copy->catchup_service_name =
         channel->catchup_service_name ? strdup(channel->catchup_service_name) : NULL;
     if ((channel->title && !copy->title) || (channel->group_title && !copy->group_title) ||
+        (channel->client_source_id && !copy->client_source_id) ||
         (channel->service_name && !copy->service_name) ||
         (channel->catchup_service_name && !copy->catchup_service_name)) {
       catalog_free_channel_list(copy);
@@ -1334,6 +1344,12 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
       }
       strncpy(current_extinf.title, base_name, sizeof(current_extinf.title) - 1);
       current_extinf.title[sizeof(current_extinf.title) - 1] = '\0';
+
+      /* RefPlayer writes this only into its private inline configuration. The
+       * value remains opaque and is surfaced separately from the helper's own
+       * stable source ID. External playlists cannot claim this capability. */
+      (void)m3u_extract_attribute(line, "refplayer-source-id", current_extinf.client_source_id,
+                                  sizeof(current_extinf.client_source_id));
 
       /* Extract group-title if present */
       if (m3u_extract_attribute(line, "group-title", current_extinf.group_title, sizeof(current_extinf.group_title)) ==
@@ -1887,7 +1903,7 @@ char *m3u_generate_refplayer_catalog(const char *host_header, const char *x_forw
       goto fail;                                                                                                      \
   } while (0)
 
-  JSON_APPEND("{\"schema_version\":1,\"helper_version\":\"");
+  JSON_APPEND("{\"schema_version\":2,\"helper_version\":\"");
   JSON_ESCAPE(VERSION);
   JSON_APPEND("\"");
   if (epg && epg->url) {
@@ -1914,7 +1930,15 @@ char *m3u_generate_refplayer_catalog(const char *host_header, const char *x_forw
     JSON_ESCAPE(channel->id);
     JSON_APPEND("\",\"title\":\"");
     JSON_ESCAPE(channel->title);
-    JSON_APPEND("\",\"group_title\":");
+    JSON_APPEND("\",\"client_source_id\":");
+    if (channel->client_source_id) {
+      JSON_APPEND("\"");
+      JSON_ESCAPE(channel->client_source_id);
+      JSON_APPEND("\"");
+    } else {
+      JSON_APPEND("null");
+    }
+    JSON_APPEND(",\"group_title\":");
     if (channel->group_title) {
       JSON_APPEND("\"");
       JSON_ESCAPE(channel->group_title);
