@@ -540,12 +540,13 @@ int sockaddr_format_ip(const struct sockaddr *sa, char *buf, size_t size) {
   return inet_ntop(sa->sa_family, addr, buf, (socklen_t)size) ? 0 : -1;
 }
 
-char *build_proxy_base_url(const char *host_header, const char *x_forwarded_host, const char *x_forwarded_proto) {
+static char *build_proxy_base_url_internal(const char *host_header, const char *x_forwarded_host,
+                                           const char *x_forwarded_proto, int allow_relative) {
   const char *host = NULL;
   const char *proto = "http";
   char *base_url = NULL;
 
-  if (config.use_relative_path_in_m3u) {
+  if (allow_relative && config.use_relative_path_in_m3u) {
     const char *prefix = (config.app_path_prefix && config.app_path_prefix[0] != '\0') ? config.app_path_prefix : "";
     size_t url_len = strlen(prefix) + 2; /* [prefix]/ + NUL */
 
@@ -619,4 +620,13 @@ char *build_proxy_base_url(const char *host_header, const char *x_forwarded_host
   }
 
   return base_url;
+}
+
+char *build_proxy_base_url(const char *host_header, const char *x_forwarded_host, const char *x_forwarded_proto) {
+  return build_proxy_base_url_internal(host_header, x_forwarded_host, x_forwarded_proto, 1);
+}
+
+char *build_absolute_proxy_base_url(const char *host_header, const char *x_forwarded_host,
+                                    const char *x_forwarded_proto) {
+  return build_proxy_base_url_internal(host_header, x_forwarded_host, x_forwarded_proto, 0);
 }

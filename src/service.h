@@ -219,6 +219,21 @@ service_t *service_create_with_query_merge(service_t *configured_service, const 
                                            service_type_t expected_type);
 
 /**
+ * Create a catchup service from the native RefPlayer epoch-range contract.
+ * The configured M3U seek template (if any) is rendered inside the helper,
+ * while path and multi-parameter URL templates continue through the normal
+ * service resolution pipeline.
+ *
+ * @param configured_service Catchup service created by the M3U parser
+ * @param start_epoch Decimal Unix timestamp in seconds
+ * @param end_epoch Decimal Unix timestamp in seconds
+ * @param user_agent Client User-Agent, used by existing timezone semantics
+ * @return Newly allocated service, or NULL on validation/allocation failure
+ */
+service_t *service_create_refplayer_catchup(service_t *configured_service, const char *start_epoch,
+                                            const char *end_epoch, const char *user_agent);
+
+/**
  * Clone a service structure (deep copy)
  * Creates a completely independent copy of the service with all fields
  * duplicated The cloned service is not added to the global services list

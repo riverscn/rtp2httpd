@@ -43,6 +43,32 @@
 /* Forward declarations */
 static void handle_playlist_request(connection_t *c);
 static void handle_epg_request(connection_t *c, int requested_gz);
+static void handle_refplayer_catalog_request(connection_t *c);
+static void handle_refplayer_ready_request(connection_t *c);
+
+static int refplayer_epoch_is_valid(const char *value, unsigned long long *parsed_value) {
+  char *end = NULL;
+  unsigned long long parsed;
+  size_t len;
+
+  if (!value || !parsed_value)
+    return 0;
+  len = strlen(value);
+  if (len == 0 || len > 10)
+    return 0;
+  for (size_t i = 0; i < len; i++) {
+    if (value[i] < '0' || value[i] > '9')
+      return 0;
+  }
+
+  errno = 0;
+  parsed = strtoull(value, &end, 10);
+  if (errno != 0 || !end || *end != '\0')
+    return 0;
+
+  *parsed_value = parsed;
+  return 1;
+}
 
 static int strip_app_path_prefix(const char *url, char *out, size_t out_size) {
   const char *prefix = config.app_path_prefix;
@@ -964,6 +990,23 @@ int connection_route_and_start(connection_t *c) {
     return 0;
   }
 
+  const char *refplayer_catalog_route = "api/refplayer/v1/catalog";
+  const char *refplayer_ready_route = "api/refplayer/v1/ready";
+  const char *refplayer_reload_route = "api/refplayer/v1/reload";
+  if (strlen(refplayer_catalog_route) == path_len &&
+      strncmp(service_path, refplayer_catalog_route, path_len) == 0) {
+    handle_refplayer_catalog_request(c);
+    return 0;
+  }
+  if (strlen(refplayer_ready_route) == path_len && strncmp(service_path, refplayer_ready_route, path_len) == 0) {
+    handle_refplayer_ready_request(c);
+    return 0;
+  }
+  if (strlen(refplayer_reload_route) == path_len && strncmp(service_path, refplayer_reload_route, path_len) == 0) {
+    handle_reload_config(c);
+    return 0;
+  }
+
   /* Handle /playlist.m3u request */
   const char *playlist_route = "playlist.m3u";
   size_t playlist_route_len = strlen(playlist_route);
@@ -1060,7 +1103,44 @@ int connection_route_and_start(connection_t *c) {
      * connection proceed with the configured service while the user's
      * overrides are discarded, so we treat NULL as a hard error. */
     logger(LOG_INFO, "Service matched: %s", service->url);
-    service = service_create_with_query_merge(service, url, service->service_type);
+    char source_id[M3U_CATALOG_ID_SIZE];
+    char start_epoch[32];
+    char end_epoch[32];
+    int has_source = 0;
+    int has_start = 0;
+    int has_end = 0;
+
+    if (query_start) {
+      has_source = http_parse_query_param(query_start + 1, "r2h-refplayer-source", source_id, sizeof(source_id)) == 0;
+      has_start =
+          http_parse_query_param(query_start + 1, "r2h-refplayer-start", start_epoch, sizeof(start_epoch)) == 0;
+      has_end = http_parse_query_param(query_start + 1, "r2h-refplayer-end", end_epoch, sizeof(end_epoch)) == 0;
+    }
+
+    if (has_source || has_start || has_end) {
+      unsigned long long start_value;
+      unsigned long long end_value;
+      const m3u_catalog_channel_t *catalog_source;
+
+      if (!has_source || !has_start || !has_end || !refplayer_epoch_is_valid(start_epoch, &start_value) ||
+          !refplayer_epoch_is_valid(end_epoch, &end_value) || end_value <= start_value) {
+        logger(LOG_WARN, "Invalid RefPlayer catchup range request");
+        http_send_400(c);
+        return 0;
+      }
+
+      catalog_source = m3u_catalog_find_source(source_id);
+      if (!catalog_source || !catalog_source->catchup_service_name ||
+          strcmp(catalog_source->catchup_service_name, decoded_path) != 0) {
+        logger(LOG_WARN, "Unknown or stale RefPlayer catchup source");
+        http_send_404(c);
+        return 0;
+      }
+
+      service = service_create_refplayer_catchup(service, start_epoch, end_epoch, c->http_req.user_agent);
+    } else {
+      service = service_create_with_query_merge(service, url, service->service_type);
+    }
     if (!service) {
       logger(LOG_ERROR, "Failed to merge query params for service");
       http_send_500(c);
@@ -1282,6 +1362,68 @@ int connection_queue_file(connection_t *c, int file_fd, off_t file_offset, size_
   c->state = CONN_CLOSING;
 
   return 0;
+}
+
+static void send_refplayer_json(connection_t *c, http_status_t status, const char *body) {
+  char headers[160];
+  size_t body_len;
+
+  if (!c || !body)
+    return;
+
+  body_len = strlen(body);
+  snprintf(headers, sizeof(headers),
+           "Content-Length: %zu\r\n"
+           "Cache-Control: no-store\r\n",
+           body_len);
+  send_http_headers(c, status, "application/json", headers);
+  if (strcasecmp(c->http_req.method, "HEAD") == 0)
+    body_len = 0;
+  connection_queue_output_and_flush(c, body_len ? (const uint8_t *)body : NULL, body_len);
+}
+
+static void handle_refplayer_catalog_request(connection_t *c) {
+  char *catalog;
+
+  if (!c)
+    return;
+  if (strcasecmp(c->http_req.method, "GET") != 0 && strcasecmp(c->http_req.method, "HEAD") != 0) {
+    send_refplayer_json(c, STATUS_400,
+                        "{\"schema_version\":1,\"error\":\"Method not allowed; use GET\"}");
+    return;
+  }
+
+  catalog = m3u_generate_refplayer_catalog(c->http_req.hostname, c->http_req.x_forwarded_host,
+                                           c->http_req.x_forwarded_proto);
+  if (!catalog) {
+    send_refplayer_json(c, STATUS_500,
+                        "{\"schema_version\":1,\"error\":\"Failed to generate catalog\"}");
+    return;
+  }
+
+  send_refplayer_json(c, STATUS_200, catalog);
+  free(catalog);
+}
+
+static void handle_refplayer_ready_request(connection_t *c) {
+  char response[256];
+  m3u_cache_t *cache;
+  int ready;
+
+  if (!c)
+    return;
+  if (strcasecmp(c->http_req.method, "GET") != 0 && strcasecmp(c->http_req.method, "HEAD") != 0) {
+    send_refplayer_json(c, STATUS_400,
+                        "{\"schema_version\":1,\"error\":\"Method not allowed; use GET\"}");
+    return;
+  }
+
+  cache = m3u_get_cache();
+  ready = m3u_refplayer_is_ready();
+  snprintf(response, sizeof(response),
+           "{\"schema_version\":1,\"ready\":%s,\"catalog_channel_count\":%zu}", ready ? "true" : "false",
+           cache ? cache->catalog_channel_count : 0);
+  send_refplayer_json(c, ready ? STATUS_200 : STATUS_503, response);
 }
 
 /* Handle /playlist.m3u request - serve dynamically generated M3U playlist */

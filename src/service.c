@@ -1584,6 +1584,58 @@ service_t *service_create_with_query_merge(service_t *configured_service, const 
   }
 }
 
+service_t *service_create_refplayer_catchup(service_t *configured_service, const char *start_epoch,
+                                            const char *end_epoch, const char *user_agent) {
+  char epoch_range[64];
+  char resolved_value[URL_TEMPLATE_FRAGMENT_SIZE];
+  char request_url[HTTP_URL_BUFFER_SIZE];
+  const char *seek_name;
+  const char *seek_value;
+  char *encoded_name = NULL;
+  char *encoded_value = NULL;
+  seek_parse_result_t parse_result;
+  service_t *result = NULL;
+  int written;
+
+  if (!configured_service || !start_epoch || !end_epoch)
+    return NULL;
+
+  written = snprintf(epoch_range, sizeof(epoch_range), "%s-%s", start_epoch, end_epoch);
+  if (written < 0 || (size_t)written >= sizeof(epoch_range))
+    return NULL;
+
+  if (service_parse_seek_value(epoch_range, 0, 0, user_agent, SEEK_MODE_PASSTHROUGH, 0, 0,
+                               SEEK_MODE_DEFAULT_WINDOW_SECONDS, &parse_result) != 0 ||
+      !parse_result.begin_parsed || !parse_result.end_parsed)
+    return NULL;
+
+  seek_name = configured_service->seek_param_name ? configured_service->seek_param_name : "playseek";
+  seek_value = epoch_range;
+  if (configured_service->seek_param_value &&
+      url_template_has_placeholders(configured_service->seek_param_value)) {
+    if (url_template_resolve(configured_service->seek_param_value, &parse_result, resolved_value,
+                             sizeof(resolved_value)) != 0)
+      return NULL;
+    seek_value = resolved_value;
+  }
+
+  encoded_name = http_url_encode(seek_name);
+  encoded_value = http_url_encode(seek_value);
+  if (!encoded_name || !encoded_value)
+    goto cleanup;
+
+  written = snprintf(request_url, sizeof(request_url), "/?%s=%s", encoded_name, encoded_value);
+  if (written < 0 || (size_t)written >= sizeof(request_url))
+    goto cleanup;
+
+  result = service_create_with_query_merge(configured_service, request_url, configured_service->service_type);
+
+cleanup:
+  free(encoded_name);
+  free(encoded_value);
+  return result;
+}
+
 service_t *service_create_from_rtp_url(const char *http_url) {
   service_t *result = NULL;
   char working_url[HTTP_URL_BUFFER_SIZE];

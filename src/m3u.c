@@ -9,7 +9,9 @@
 #include "utils.h"
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
 #include <ifaddrs.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,9 +27,11 @@
 
 /* Structure to store parsed EXTINF data */
 struct m3u_extinf {
+  char title[MAX_SERVICE_NAME];
   char name[MAX_SERVICE_NAME];
   char group_title[MAX_SERVICE_NAME];
   char catchup_source[MAX_URL_LENGTH];
+  double catchup_retention_seconds;
   int has_catchup;
 };
 
@@ -37,6 +41,99 @@ static m3u_cache_t m3u_cache = {0};
 /* Retry delays in seconds: 2, 4, 8, 16, 32, 64, 128, 256 */
 static const int m3u_retry_delays[] = {2, 4, 8, 16, 32, 64, 128, 256};
 #define M3U_MAX_RETRY_COUNT 8
+
+static void catalog_free_channel_list(m3u_catalog_channel_t *channel) {
+  while (channel) {
+    m3u_catalog_channel_t *next = channel->next;
+    free(channel->title);
+    free(channel->group_title);
+    free(channel->service_name);
+    free(channel->catchup_service_name);
+    free(channel);
+    channel = next;
+  }
+}
+
+static void catalog_hash_part(MD5Context *ctx, const char *value) {
+  uint8_t separator = 0;
+  if (value)
+    md5Update(ctx, (uint8_t *)(uintptr_t)value, strlen(value));
+  md5Update(ctx, &separator, 1);
+}
+
+static void catalog_hash_duplicate_source(const char *base_id, unsigned int occurrence,
+                                          char output[M3U_CATALOG_ID_SIZE]) {
+  MD5Context ctx;
+  char occurrence_text[32];
+
+  md5Init(&ctx);
+  catalog_hash_part(&ctx, "source-duplicate");
+  catalog_hash_part(&ctx, base_id);
+  snprintf(occurrence_text, sizeof(occurrence_text), "%u", occurrence);
+  catalog_hash_part(&ctx, occurrence_text);
+  md5Finalize(&ctx);
+  md5_to_hex(ctx.digest, output);
+}
+
+static void catalog_hash_source(const struct m3u_extinf *extinf, const char *source_url, const char *label,
+                                const char *catchup_url, char output[M3U_CATALOG_ID_SIZE]) {
+  MD5Context ctx;
+
+  md5Init(&ctx);
+  catalog_hash_part(&ctx, "source");
+  catalog_hash_part(&ctx, extinf->group_title);
+  catalog_hash_part(&ctx, extinf->title);
+  catalog_hash_part(&ctx, source_url);
+  catalog_hash_part(&ctx, label);
+  catalog_hash_part(&ctx, catchup_url);
+  md5Finalize(&ctx);
+  md5_to_hex(ctx.digest, output);
+}
+
+static int catalog_source_id_exists(const char *source_id) {
+  for (m3u_catalog_channel_t *channel = m3u_cache.catalog_channels; channel; channel = channel->next) {
+    if (strcmp(channel->id, source_id) == 0)
+      return 1;
+  }
+  return 0;
+}
+
+static int catalog_add_channel(const struct m3u_extinf *extinf, const char *service_name, const char *label,
+                               const char *catchup_service_name, const char *source_url, const char *catchup_url,
+                               service_source_t source_kind) {
+  m3u_catalog_channel_t *channel;
+
+  if (!extinf || !service_name)
+    return -1;
+
+  channel = calloc(1, sizeof(*channel));
+  if (!channel)
+    return -1;
+  channel->title = strdup(extinf->title);
+  channel->group_title = extinf->group_title[0] ? strdup(extinf->group_title) : NULL;
+  channel->service_name = strdup(service_name);
+  channel->catchup_service_name = catchup_service_name ? strdup(catchup_service_name) : NULL;
+  channel->catchup_retention_seconds = extinf->catchup_retention_seconds;
+  if (!channel->title || (extinf->group_title[0] && !channel->group_title) || !channel->service_name ||
+      (catchup_service_name && !channel->catchup_service_name)) {
+    catalog_free_channel_list(channel);
+    return -1;
+  }
+  catalog_hash_source(extinf, source_url, label, catchup_url, channel->id);
+  char base_id[M3U_CATALOG_ID_SIZE];
+  memcpy(base_id, channel->id, sizeof(base_id));
+  for (unsigned int occurrence = 2; catalog_source_id_exists(channel->id); occurrence++)
+    catalog_hash_duplicate_source(base_id, occurrence, channel->id);
+  channel->source_kind = source_kind;
+
+  if (m3u_cache.catalog_channels_tail)
+    m3u_cache.catalog_channels_tail->next = channel;
+  else
+    m3u_cache.catalog_channels = channel;
+  m3u_cache.catalog_channels_tail = channel;
+  m3u_cache.catalog_channel_count++;
+  return 0;
+}
 
 static int append_path_with_trailing_slash(char *base, size_t base_size, const char *path) {
   size_t len;
@@ -914,6 +1011,48 @@ static void free_transformed_m3u_buffer(m3u_cache_t *cache) {
   cache->transformed_m3u_has_header = 0;
   cache->transformed_m3u_etag_valid = 0;
   cache->transformed_m3u_etag[0] = '\0';
+
+  catalog_free_channel_list(cache->catalog_channels);
+  cache->catalog_channels = NULL;
+  cache->catalog_channels_tail = NULL;
+  cache->catalog_channel_count = 0;
+  cache->external_catalog_ready = 0;
+}
+
+static int catalog_clone_cache(const m3u_cache_t *source, m3u_cache_t *destination) {
+  m3u_catalog_channel_t **tail = &destination->catalog_channels;
+
+  destination->catalog_channels = NULL;
+  destination->catalog_channels_tail = NULL;
+  for (const m3u_catalog_channel_t *channel = source->catalog_channels; channel; channel = channel->next) {
+    m3u_catalog_channel_t *copy = calloc(1, sizeof(*copy));
+    if (!copy)
+      goto fail;
+    memcpy(copy->id, channel->id, sizeof(copy->id));
+    copy->source_kind = channel->source_kind;
+    copy->catchup_retention_seconds = channel->catchup_retention_seconds;
+    copy->title = channel->title ? strdup(channel->title) : NULL;
+    copy->group_title = channel->group_title ? strdup(channel->group_title) : NULL;
+    copy->service_name = channel->service_name ? strdup(channel->service_name) : NULL;
+    copy->catchup_service_name =
+        channel->catchup_service_name ? strdup(channel->catchup_service_name) : NULL;
+    if ((channel->title && !copy->title) || (channel->group_title && !copy->group_title) ||
+        (channel->service_name && !copy->service_name) ||
+        (channel->catchup_service_name && !copy->catchup_service_name)) {
+      catalog_free_channel_list(copy);
+      goto fail;
+    }
+    *tail = copy;
+    tail = &copy->next;
+    destination->catalog_channels_tail = copy;
+  }
+  return 0;
+
+fail:
+  catalog_free_channel_list(destination->catalog_channels);
+  destination->catalog_channels = NULL;
+  destination->catalog_channels_tail = NULL;
+  return -1;
 }
 
 /* Find a unique service name by adding numeric suffix if needed
@@ -1178,6 +1317,8 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
         in_entry = 0;
         continue;
       }
+      strncpy(current_extinf.title, base_name, sizeof(current_extinf.title) - 1);
+      current_extinf.title[sizeof(current_extinf.title) - 1] = '\0';
 
       /* Extract group-title if present */
       if (extract_attribute(line, "group-title", current_extinf.group_title, sizeof(current_extinf.group_title)) == 0 &&
@@ -1212,6 +1353,14 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
       if (extract_attribute(line, "catchup-source", current_extinf.catchup_source,
                             sizeof(current_extinf.catchup_source)) == 0) {
         current_extinf.has_catchup = 1;
+      }
+      char catchup_days[64];
+      if (extract_attribute(line, "catchup-days", catchup_days, sizeof(catchup_days)) == 0) {
+        char *end = NULL;
+        errno = 0;
+        double days = strtod(catchup_days, &end);
+        if (errno == 0 && end != catchup_days && *end == '\0' && isfinite(days) && days > 0 && days <= 3650)
+          current_extinf.catchup_retention_seconds = days * 86400;
       }
 
       /* Store original EXTINF line for later processing */
@@ -1356,6 +1505,12 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
 
           if (main_query)
             free(main_query);
+          if (catalog_add_channel(&current_extinf, unique_service_name,
+                                  url_label_copy[0] == '$' ? url_label_copy + 1 : NULL, unique_catchup_name,
+                                  line_without_label, catchup_service_url, service_source) != 0) {
+            logger(LOG_WARN, "Failed to add M3U entry to RefPlayer catalog: %s", current_extinf.title);
+          }
+
           if (unique_catchup_name)
             free(unique_catchup_name);
           free(unique_service_name);
@@ -1390,6 +1545,9 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
 
   logger(LOG_INFO, "Parsed %d M3U entries, generated transformed playlist (%zu bytes)", entry_count,
          m3u_cache.transformed_m3u_used);
+
+  if (service_source == SERVICE_SOURCE_EXTERNAL)
+    m3u_cache.external_catalog_ready = 1;
 
   return 0;
 }
@@ -1574,6 +1732,200 @@ const char *m3u_get_etag(void) {
   return m3u_cache.transformed_m3u_etag;
 }
 
+typedef struct {
+  char *data;
+  size_t used;
+  size_t size;
+} catalog_json_buffer_t;
+
+static int catalog_json_reserve(catalog_json_buffer_t *buffer, size_t needed) {
+  size_t new_size;
+  char *new_data;
+
+  if (buffer->used + needed + 1 <= buffer->size)
+    return 0;
+
+  new_size = buffer->size ? buffer->size : 4096;
+  while (new_size < buffer->used + needed + 1) {
+    if (new_size > SIZE_MAX / 2)
+      return -1;
+    new_size *= 2;
+  }
+  new_data = realloc(buffer->data, new_size);
+  if (!new_data)
+    return -1;
+  buffer->data = new_data;
+  buffer->size = new_size;
+  return 0;
+}
+
+static int catalog_json_append(catalog_json_buffer_t *buffer, const char *value) {
+  size_t value_len = strlen(value);
+  if (catalog_json_reserve(buffer, value_len) != 0)
+    return -1;
+  memcpy(buffer->data + buffer->used, value, value_len);
+  buffer->used += value_len;
+  buffer->data[buffer->used] = '\0';
+  return 0;
+}
+
+static int catalog_json_append_escaped(catalog_json_buffer_t *buffer, const char *value) {
+  char *escaped = json_escape_string(value ? value : "");
+  int result;
+  if (!escaped)
+    return -1;
+  result = catalog_json_append(buffer, escaped);
+  free(escaped);
+  return result;
+}
+
+static int catalog_json_append_service_url(catalog_json_buffer_t *buffer, const char *base_url,
+                                           const char *service_name, const char *token) {
+  char *encoded_name = http_url_encode(service_name);
+  char *encoded_token = token && token[0] ? http_url_encode(token) : NULL;
+  int result = -1;
+
+  if (!encoded_name || (token && token[0] && !encoded_token))
+    goto cleanup;
+  if (catalog_json_append_escaped(buffer, base_url) != 0 || catalog_json_append_escaped(buffer, encoded_name) != 0)
+    goto cleanup;
+  if (encoded_token) {
+    if (catalog_json_append(buffer, "?r2h-token=") != 0 || catalog_json_append_escaped(buffer, encoded_token) != 0)
+      goto cleanup;
+  }
+  result = 0;
+
+cleanup:
+  free(encoded_name);
+  free(encoded_token);
+  return result;
+}
+
+static int catalog_json_append_catchup(catalog_json_buffer_t *buffer, const char *base_url,
+                                       const m3u_catalog_channel_t *channel, const char *token) {
+  char retention[64];
+
+  if (!channel->catchup_service_name)
+    return catalog_json_append(buffer, "null");
+
+  if (catalog_json_append(buffer, "{\"url\":\"") != 0 ||
+      catalog_json_append_service_url(buffer, base_url, channel->catchup_service_name, token) != 0 ||
+      catalog_json_append(buffer, token && token[0] ? "&r2h-refplayer-source=" : "?r2h-refplayer-source=") != 0 ||
+      catalog_json_append_escaped(buffer, channel->id) != 0 ||
+      catalog_json_append(buffer, "\",\"retention_seconds\":") != 0)
+    return -1;
+
+  if (channel->catchup_retention_seconds > 0) {
+    int written = snprintf(retention, sizeof(retention), "%.17g", channel->catchup_retention_seconds);
+    if (written < 0 || (size_t)written >= sizeof(retention) || catalog_json_append(buffer, retention) != 0)
+      return -1;
+  } else if (catalog_json_append(buffer, "null") != 0) {
+    return -1;
+  }
+
+  return catalog_json_append(buffer, "}");
+}
+
+static int catalog_json_append_playback(catalog_json_buffer_t *buffer, const char *base_url,
+                                        const m3u_catalog_channel_t *channel, const char *token) {
+  if (catalog_json_append(buffer, "\"live_url\":\"") != 0 ||
+      catalog_json_append_service_url(buffer, base_url, channel->service_name, token) != 0 ||
+      catalog_json_append(buffer, "\",\"catchup\":") != 0 ||
+      catalog_json_append_catchup(buffer, base_url, channel, token) != 0)
+    return -1;
+
+  return 0;
+}
+
+const m3u_catalog_channel_t *m3u_catalog_find_source(const char *source_id) {
+  if (!source_id || strlen(source_id) != M3U_CATALOG_ID_SIZE - 1)
+    return NULL;
+
+  for (m3u_catalog_channel_t *channel = m3u_cache.catalog_channels; channel; channel = channel->next) {
+    if (strcmp(channel->id, source_id) == 0)
+      return channel;
+  }
+  return NULL;
+}
+
+int m3u_refplayer_is_ready(void) { return !config.external_m3u_url || m3u_cache.external_catalog_ready; }
+
+char *m3u_generate_refplayer_catalog(const char *host_header, const char *x_forwarded_host,
+                                     const char *x_forwarded_proto) {
+  catalog_json_buffer_t json = {0};
+  char *base_url = build_absolute_proxy_base_url(host_header, x_forwarded_host, x_forwarded_proto);
+  epg_cache_t *epg = epg_get_cache();
+  int first_channel = 1;
+
+  if (!base_url)
+    return NULL;
+
+#define JSON_APPEND(value)                                                                                            \
+  do {                                                                                                                \
+    if (catalog_json_append(&json, (value)) != 0)                                                                     \
+      goto fail;                                                                                                      \
+  } while (0)
+#define JSON_ESCAPE(value)                                                                                            \
+  do {                                                                                                                \
+    if (catalog_json_append_escaped(&json, (value)) != 0)                                                             \
+      goto fail;                                                                                                      \
+  } while (0)
+
+  JSON_APPEND("{\"schema_version\":1,\"helper_version\":\"");
+  JSON_ESCAPE(VERSION);
+  JSON_APPEND("\"");
+  if (epg && epg->url) {
+    JSON_APPEND(",\"epg_url\":\"");
+    JSON_ESCAPE(base_url);
+    JSON_APPEND(epg->is_gzipped ? "epg.xml.gz" : "epg.xml");
+    if (config.r2h_token && config.r2h_token[0]) {
+      char *encoded_token = http_url_encode(config.r2h_token);
+      if (!encoded_token)
+        goto fail;
+      JSON_APPEND("?r2h-token=");
+      JSON_ESCAPE(encoded_token);
+      free(encoded_token);
+    }
+    JSON_APPEND("\"");
+  }
+  JSON_APPEND(",\"channels\":[");
+
+  for (m3u_catalog_channel_t *channel = m3u_cache.catalog_channels; channel; channel = channel->next) {
+    if (!first_channel)
+      JSON_APPEND(",");
+    first_channel = 0;
+    JSON_APPEND("{\"id\":\"");
+    JSON_ESCAPE(channel->id);
+    JSON_APPEND("\",\"title\":\"");
+    JSON_ESCAPE(channel->title);
+    JSON_APPEND("\",\"group_title\":");
+    if (channel->group_title) {
+      JSON_APPEND("\"");
+      JSON_ESCAPE(channel->group_title);
+      JSON_APPEND("\"");
+    } else {
+      JSON_APPEND("null");
+    }
+    JSON_APPEND(",");
+    if (catalog_json_append_playback(&json, base_url, channel, config.r2h_token) != 0)
+      goto fail;
+    JSON_APPEND("}");
+  }
+  JSON_APPEND("]}");
+
+#undef JSON_APPEND
+#undef JSON_ESCAPE
+  free(base_url);
+  return json.data;
+
+fail:
+#undef JSON_APPEND
+#undef JSON_ESCAPE
+  free(base_url);
+  free(json.data);
+  return NULL;
+}
+
 void m3u_reset_transformed_playlist(void) { free_transformed_m3u_buffer(&m3u_cache); }
 
 int m3u_cache_snapshot(m3u_cache_t *snapshot) {
@@ -1582,6 +1934,8 @@ int m3u_cache_snapshot(m3u_cache_t *snapshot) {
 
   *snapshot = m3u_cache;
   snapshot->transformed_m3u = NULL;
+  snapshot->catalog_channels = NULL;
+  snapshot->catalog_channels_tail = NULL;
 
   if (m3u_cache.transformed_m3u && m3u_cache.transformed_m3u_size > 0) {
     snapshot->transformed_m3u = malloc(m3u_cache.transformed_m3u_size);
@@ -1590,6 +1944,12 @@ int m3u_cache_snapshot(m3u_cache_t *snapshot) {
       return -1;
     }
     memcpy(snapshot->transformed_m3u, m3u_cache.transformed_m3u, m3u_cache.transformed_m3u_size);
+  }
+
+  if (catalog_clone_cache(&m3u_cache, snapshot) != 0) {
+    free_transformed_m3u_buffer(snapshot);
+    memset(snapshot, 0, sizeof(*snapshot));
+    return -1;
   }
 
   return 0;
@@ -1627,6 +1987,25 @@ void m3u_reset_external_playlist(void) {
    * added */
   if (m3u_cache.transformed_m3u_inline_end == 0) {
     m3u_cache.transformed_m3u_has_header = 0;
+  }
+
+  /* Remove only externally loaded catalog entries; inline entries preserve
+   * their original playlist order across reloads. */
+  m3u_catalog_channel_t **channel_link = &m3u_cache.catalog_channels;
+  m3u_cache.catalog_channels_tail = NULL;
+  m3u_cache.catalog_channel_count = 0;
+  while (*channel_link) {
+    m3u_catalog_channel_t *channel = *channel_link;
+    if (channel->source_kind == SERVICE_SOURCE_EXTERNAL) {
+      *channel_link = channel->next;
+      channel->next = NULL;
+      catalog_free_channel_list(channel);
+      continue;
+    }
+
+    m3u_cache.catalog_channels_tail = channel;
+    m3u_cache.catalog_channel_count++;
+    channel_link = &channel->next;
   }
 }
 

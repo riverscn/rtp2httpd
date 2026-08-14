@@ -120,6 +120,14 @@ const char *get_upstream_interface_for_http(const char *override);
 char *build_proxy_base_url(const char *host_header, const char *x_forwarded_host, const char *x_forwarded_proto);
 
 /**
+ * Build an absolute proxy base URL for machine-readable APIs.  Unlike
+ * build_proxy_base_url(), this ignores use-relative-path-in-m3u so native
+ * clients always receive a complete URL derived from the request authority.
+ */
+char *build_absolute_proxy_base_url(const char *host_header, const char *x_forwarded_host,
+                                    const char *x_forwarded_proto);
+
+/**
  * Get local IP address for FCC packets
  * Uses the configured upstream interface for FCC, or falls back to first
  * non-loopback address

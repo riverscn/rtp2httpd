@@ -4,6 +4,22 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#define M3U_CATALOG_ID_SIZE 33
+
+/* RefPlayer-facing channel catalog.  This deliberately stores only normalized
+ * helper routes and presentation metadata; upstream protocol URLs remain
+ * private to service_t. */
+typedef struct m3u_catalog_channel_s {
+  char id[M3U_CATALOG_ID_SIZE];
+  char *title;
+  char *group_title;
+  char *service_name;
+  char *catchup_service_name;
+  double catchup_retention_seconds;
+  int source_kind;
+  struct m3u_catalog_channel_s *next;
+} m3u_catalog_channel_t;
+
 /* M3U cache structure for external M3U state tracking */
 typedef struct {
   int retry_count;         /* Current retry count (0-8) */
@@ -20,6 +36,13 @@ typedef struct {
   /* ETag for transformed M3U playlist */
   char transformed_m3u_etag[33];  /* MD5 hash as hex string */
   int transformed_m3u_etag_valid; /* 1 if etag is valid, 0 otherwise */
+
+  /* Structured native-player catalog, built by the same parser that creates
+   * streaming services. */
+  m3u_catalog_channel_t *catalog_channels;
+  m3u_catalog_channel_t *catalog_channels_tail;
+  size_t catalog_channel_count; /* Number of top-level RefPlayer entries */
+  int external_catalog_ready;
 } m3u_cache_t;
 
 /* Parse M3U content and create services
@@ -97,5 +120,17 @@ int m3u_reload_external_async(int epfd);
  * Returns: pointer to m3u_cache_t structure
  */
 m3u_cache_t *m3u_get_cache(void);
+
+/* Generate the versioned RefPlayer catalog as JSON.  URLs are generated from
+ * request headers exactly like /playlist.m3u.  Returns malloc'd JSON. */
+char *m3u_generate_refplayer_catalog(const char *host_header, const char *x_forwarded_host,
+                                     const char *x_forwarded_proto);
+
+/* Resolve opaque source IDs used by the RefPlayer catalog. */
+const m3u_catalog_channel_t *m3u_catalog_find_source(const char *source_id);
+
+/* True once the configured external M3U has completed its first successful
+ * parse, or immediately when no external M3U is configured. */
+int m3u_refplayer_is_ready(void);
 
 #endif /* __M3U_H__ */
