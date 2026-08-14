@@ -14,6 +14,7 @@
 #include "zerocopy.h"
 #include <errno.h>
 #include <netdb.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,16 +45,76 @@ static int desired_workers = 0;
 static volatile sig_atomic_t supervisor_stop_flag = 0;
 static volatile sig_atomic_t supervisor_reload_flag = 0;
 static volatile sig_atomic_t supervisor_restart_workers_flag = 0;
+static int refplayer_lifetime_stdin_enabled = 0;
 
 /* Forward declarations */
 static void supervisor_signal_handler(int signum);
 static void supervisor_sighup_handler(int signum);
 static void supervisor_sigusr1_handler(int signum);
+static void supervisor_check_refplayer_lifetime_stdin(void);
 static int spawn_worker(int worker_idx);
 static void restore_reload_snapshot(config_t *old_config, service_t **old_services, bindaddr_t **old_bind_addresses,
                                     m3u_cache_t *old_m3u_cache, epg_cache_t *old_epg_cache);
 static void free_reload_snapshot(config_t *old_config, service_t *old_services, bindaddr_t *old_bind_addresses,
                                  m3u_cache_t *old_m3u_cache, epg_cache_t *old_epg_cache);
+
+int supervisor_prepare_refplayer_lifetime(void) {
+  const char *enabled = getenv("RTP2HTTPD_REFPLAYER_LIFETIME_STDIN");
+
+  if (!enabled || strcmp(enabled, "1") != 0)
+    return 0;
+
+  if (getpgrp() != getpid() && setpgid(0, 0) < 0) {
+    logger(LOG_FATAL, "Failed to create RefPlayer helper process group: %s", strerror(errno));
+    return -1;
+  }
+
+  refplayer_lifetime_stdin_enabled = 1;
+  return 0;
+}
+
+static void supervisor_check_refplayer_lifetime_stdin(void) {
+  struct pollfd lifetime_fd;
+  char byte;
+  int poll_result;
+  ssize_t read_result;
+
+  if (!refplayer_lifetime_stdin_enabled || supervisor_stop_flag)
+    return;
+
+  memset(&lifetime_fd, 0, sizeof(lifetime_fd));
+  lifetime_fd.fd = STDIN_FILENO;
+  lifetime_fd.events = POLLIN;
+
+  poll_result = poll(&lifetime_fd, 1, 0);
+  if (poll_result < 0) {
+    if (errno == EINTR)
+      return;
+    logger(LOG_ERROR, "RefPlayer lifetime stdin poll failed: %s; shutting down", strerror(errno));
+    supervisor_stop_flag = 1;
+    return;
+  }
+  if (poll_result == 0)
+    return;
+
+  if (lifetime_fd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+    logger(LOG_INFO, "RefPlayer lifetime stdin closed, shutting down");
+    supervisor_stop_flag = 1;
+    return;
+  }
+
+  if (!(lifetime_fd.revents & POLLIN))
+    return;
+
+  read_result = read(STDIN_FILENO, &byte, sizeof(byte));
+  if (read_result == 0) {
+    logger(LOG_INFO, "RefPlayer lifetime stdin reached EOF, shutting down");
+    supervisor_stop_flag = 1;
+  } else if (read_result < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+    logger(LOG_ERROR, "RefPlayer lifetime stdin read failed: %s; shutting down", strerror(errno));
+    supervisor_stop_flag = 1;
+  }
+}
 
 /**
  * Signal handler for supervisor process (SIGTERM/SIGINT)
@@ -178,6 +239,7 @@ static int spawn_worker(int worker_idx) {
 
   if (pid == 0) {
     /* Child process: become a worker */
+    int parent_monitor_fd = -1;
 
     worker_restore_default_signal_handlers();
     worker_install_sighup_handler();
@@ -190,11 +252,19 @@ static int spawn_worker(int worker_idx) {
     /* Ensure child dies when parent (supervisor) exits */
     platform_set_parent_death_signal(SIGTERM);
 
+    if (refplayer_lifetime_stdin_enabled)
+      parent_monitor_fd = platform_parent_monitor_create(supervisor_pid);
+
     /* Check if parent already exited (race condition protection) */
     if (getppid() != supervisor_pid) {
+      if (parent_monitor_fd >= 0)
+        close(parent_monitor_fd);
       /* Parent already exited, exit immediately */
       _exit(EXIT_FAILURE);
     }
+
+    if (refplayer_lifetime_stdin_enabled && worker_start_parent_monitor(supervisor_pid, parent_monitor_fd) < 0)
+      _exit(EXIT_FAILURE);
 
     /* Set worker ID */
     worker_id = worker_idx;
@@ -291,6 +361,9 @@ static void free_reload_snapshot(config_t *old_config, service_t *old_services, 
 int supervisor_run(void) {
   int i;
 
+  if (supervisor_prepare_refplayer_lifetime() < 0)
+    return -1;
+
   desired_workers = config.workers;
 
   /* Initialize worker info */
@@ -336,6 +409,10 @@ int supervisor_run(void) {
   while (!supervisor_stop_flag) {
     int status;
     pid_t pid;
+
+    supervisor_check_refplayer_lifetime_stdin();
+    if (supervisor_stop_flag)
+      break;
 
     status_supervisor_drain_logs();
 

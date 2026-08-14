@@ -12,8 +12,12 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <stddef.h> /* NULL */
+#include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 /* ── MSG_NOSIGNAL ────────────────────────────────────────────────────
  * Linux/FreeBSD have MSG_NOSIGNAL as a per-send flag.
@@ -156,16 +160,67 @@ static inline int platform_bind_to_device(int sock, const char *ifname) {
 }
 #endif
 
-/* ── prctl / PR_SET_PDEATHSIG ────────────────────────────────────────
+/* ── parent process lifetime ─────────────────────────────────────────
  * Linux: prctl(PR_SET_PDEATHSIG, sig) ensures child dies when parent exits.
- * macOS: No direct equivalent. We use a no-op; the supervisor already
- *        monitors children via waitpid() and re-checks getppid().
+ * macOS/FreeBSD: EVFILT_PROC NOTE_EXIT provides an equivalent observable
+ * parent-death event. A worker-side monitor thread consumes this event and
+ * retains getppid() as a registration-race fallback.
  */
 #ifdef __linux__
 #include <sys/prctl.h>
 static inline void platform_set_parent_death_signal(int sig) { prctl(PR_SET_PDEATHSIG, sig); }
 #else
 static inline void platform_set_parent_death_signal(int sig) { (void)sig; }
+#endif
+
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/event.h>
+static inline int platform_parent_monitor_create(pid_t parent_pid) {
+  struct kevent change;
+  int fd = kqueue();
+
+  if (fd < 0)
+    return -1;
+  EV_SET(&change, (uintptr_t)parent_pid, EVFILT_PROC, EV_ADD | EV_ENABLE | EV_CLEAR, NOTE_EXIT, 0, NULL);
+  if (kevent(fd, &change, 1, NULL, 0, NULL) < 0) {
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return -1;
+  }
+  return fd;
+}
+
+static inline int platform_parent_monitor_poll(int fd, int timeout_ms) {
+  struct kevent event;
+  struct timespec timeout;
+  int result;
+
+  if (fd < 0 || timeout_ms < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  timeout.tv_sec = timeout_ms / 1000;
+  timeout.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+  do {
+    result = kevent(fd, NULL, 0, &event, 1, &timeout);
+  } while (result < 0 && errno == EINTR);
+  if (result <= 0)
+    return result;
+  return event.filter == EVFILT_PROC && (event.fflags & NOTE_EXIT) != 0;
+}
+#else
+static inline int platform_parent_monitor_create(pid_t parent_pid) {
+  (void)parent_pid;
+  errno = ENOTSUP;
+  return -1;
+}
+static inline int platform_parent_monitor_poll(int fd, int timeout_ms) {
+  (void)fd;
+  (void)timeout_ms;
+  errno = ENOTSUP;
+  return -1;
+}
 #endif
 
 /* ── ip_mreqn ────────────────────────────────────────────────────────

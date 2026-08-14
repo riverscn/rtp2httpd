@@ -2,6 +2,7 @@
 #define WORKER_H
 
 #include "connection.h"
+#include <sys/types.h>
 
 /**
  * fd -> connection map using hashmap for O(1) lookups
@@ -39,6 +40,12 @@ void fdmap_cleanup(void);
 
 /** Install the worker SIGHUP handler before startup signals are unblocked. */
 void worker_install_sighup_handler(void);
+
+/**
+ * Start the RefPlayer worker's supervisor-liveness monitor.
+ * Ownership of parent_monitor_fd transfers to the monitor on success.
+ */
+int worker_start_parent_monitor(pid_t parent_pid, int parent_monitor_fd);
 
 /**
  * Run the worker event loop

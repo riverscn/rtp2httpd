@@ -6,6 +6,7 @@
 #include "hashmap.h"
 #include "http_fetch.h"
 #include "m3u.h"
+#include "platform_compat.h"
 #include "poller.h"
 #include "rtp2httpd.h"
 #include "status.h"
@@ -13,10 +14,12 @@
 #include "utils.h"
 #include "zerocopy.h"
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 /* fd -> connection map entry */
@@ -37,7 +40,80 @@ static volatile sig_atomic_t stop_flag = 0;
 /* Reload flag for SIGHUP handling */
 static volatile sig_atomic_t reload_flag = 0;
 
+typedef struct {
+  pid_t parent_pid;
+  int monitor_fd;
+} worker_parent_monitor_t;
+
 #define WORKER_MAX_WRITE_BATCH 128
+
+static void *worker_parent_monitor_main(void *argument) {
+  worker_parent_monitor_t *monitor = argument;
+
+  for (;;) {
+    int parent_exited = 0;
+    if (monitor->monitor_fd >= 0) {
+      int poll_result = platform_parent_monitor_poll(monitor->monitor_fd, 100);
+      if (poll_result > 0)
+        parent_exited = 1;
+      else if (poll_result < 0) {
+        close(monitor->monitor_fd);
+        monitor->monitor_fd = -1;
+      }
+    } else {
+      struct timespec interval = {.tv_sec = 0, .tv_nsec = 100000000L};
+      while (nanosleep(&interval, &interval) < 0 && errno == EINTR) {
+      }
+    }
+
+    if (parent_exited || getppid() != monitor->parent_pid) {
+      /* Before the event loop installs its handler this terminates directly;
+       * afterwards it enters the worker's ordinary graceful-stop path. */
+      kill(getpid(), SIGTERM);
+      break;
+    }
+  }
+
+  if (monitor->monitor_fd >= 0)
+    close(monitor->monitor_fd);
+  free(monitor);
+  return NULL;
+}
+
+int worker_start_parent_monitor(pid_t parent_pid, int parent_monitor_fd) {
+  worker_parent_monitor_t *monitor;
+  pthread_t thread;
+  int result;
+
+  if (parent_pid <= 1) {
+    if (parent_monitor_fd >= 0)
+      close(parent_monitor_fd);
+    return -1;
+  }
+  monitor = malloc(sizeof(*monitor));
+  if (!monitor) {
+    if (parent_monitor_fd >= 0)
+      close(parent_monitor_fd);
+    return -1;
+  }
+  monitor->parent_pid = parent_pid;
+  monitor->monitor_fd = parent_monitor_fd;
+  result = pthread_create(&thread, NULL, worker_parent_monitor_main, monitor);
+  if (result != 0) {
+    if (parent_monitor_fd >= 0)
+      close(parent_monitor_fd);
+    free(monitor);
+    errno = result;
+    return -1;
+  }
+  result = pthread_detach(thread);
+  if (result != 0) {
+    /* The monitor is already active and owns its state. Failure to detach is
+     * not a parent-liveness failure; process exit will reclaim the thread. */
+    logger(LOG_WARN, "Failed to detach parent monitor thread: %s", strerror(result));
+  }
+  return 0;
+}
 
 /**
  * Hash function for file descriptors
