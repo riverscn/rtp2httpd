@@ -155,6 +155,9 @@ int service_extract_seek_params(char *query_start, char **out_seek_param_name, c
                                 seek_mode_t *out_seek_mode, int *out_seek_mode_tz_explicit,
                                 int *out_seek_mode_tz_offset_seconds, int *out_seek_mode_window_seconds);
 
+/** Parse the value of r2h-seek-offset into begin/end epoch adjustments. */
+int service_parse_seek_offset_value(char *value, int *out_begin_offset_seconds, int *out_end_offset_seconds);
+
 /**
  * Analyze a seek parameter once and reuse the result across RTSP/HTTP flows.
  *

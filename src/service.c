@@ -417,7 +417,7 @@ static int parse_seek_offset_component(const char *value, int *out_offset_second
   return 0;
 }
 
-static int parse_seek_offset_value(char *value, int *out_begin_offset_seconds, int *out_end_offset_seconds) {
+int service_parse_seek_offset_value(char *value, int *out_begin_offset_seconds, int *out_end_offset_seconds) {
   int begin_offset_seconds;
   int end_offset_seconds;
   char *comma;
@@ -552,7 +552,7 @@ int service_extract_seek_params(char *query_start, char **out_seek_param_name, c
     char offset_log_buf[sizeof(offset_buf)];
     strncpy(offset_log_buf, offset_buf, sizeof(offset_log_buf) - 1);
     offset_log_buf[sizeof(offset_log_buf) - 1] = '\0';
-    if (parse_seek_offset_value(offset_buf, &seek_begin_offset_seconds, &seek_end_offset_seconds) == 0) {
+    if (service_parse_seek_offset_value(offset_buf, &seek_begin_offset_seconds, &seek_end_offset_seconds) == 0) {
       if (seek_begin_offset_seconds == seek_end_offset_seconds) {
         logger(LOG_DEBUG, "Found r2h-seek-offset parameter: %d seconds", seek_begin_offset_seconds);
       } else {

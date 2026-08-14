@@ -178,7 +178,7 @@ int m3u_is_header(const char *line) { return (strncmp(line, "#EXTM3U", 7) == 0);
  * Returns: malloc'd string containing URL (caller must free), or NULL if not
  * found
  */
-static char *extract_tvg_url(const char *line) {
+char *m3u_extract_tvg_url(const char *line) {
   const char *attr_start;
   const char *value_start;
   const char *value_end;
@@ -528,7 +528,8 @@ char *get_server_address(void) {
 /* Extract attribute value from EXTINF line
  * Example: catchup-source="rtsp://..." extracts the URL
  */
-static int extract_attribute(const char *line, const char *attr_name, char *value, size_t value_size) {
+int m3u_extract_attribute_at(const char *line, const char *attr_name, size_t occurrence, char *value,
+                             size_t value_size) {
   char search_pattern[128];
   const char *attr_start;
   const char *value_start;
@@ -536,9 +537,19 @@ static int extract_attribute(const char *line, const char *attr_name, char *valu
   size_t value_len;
 
   snprintf(search_pattern, sizeof(search_pattern), "%s=", attr_name);
-  attr_start = strstr(line, search_pattern);
-  if (!attr_start) {
-    return -1;
+  attr_start = line;
+  for (size_t index = 0;;) {
+    attr_start = strstr(attr_start, search_pattern);
+    if (!attr_start)
+      return -1;
+
+    /* Attribute names must begin at a token boundary. */
+    if (attr_start == line || isspace((unsigned char)attr_start[-1])) {
+      if (index == occurrence)
+        break;
+      index++;
+    }
+    attr_start += strlen(search_pattern);
   }
 
   value_start = attr_start + strlen(search_pattern);
@@ -574,11 +585,15 @@ static int extract_attribute(const char *line, const char *attr_name, char *valu
   return 0;
 }
 
+int m3u_extract_attribute(const char *line, const char *attr_name, char *value, size_t value_size) {
+  return m3u_extract_attribute_at(line, attr_name, 0, value, value_size);
+}
+
 /* Extract service name from EXTINF line
  * Format: #EXTINF:-1 ... ,ServiceName
  * Returns the text after the last comma
  */
-static int extract_service_name(const char *line, char *name, size_t name_size) {
+int m3u_extract_service_name(const char *line, char *name, size_t name_size) {
   const char *comma_pos;
   const char *name_start;
   size_t name_len;
@@ -1284,7 +1299,7 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
     /* Handle M3U header */
     if (m3u_is_header(line)) {
       /* Extract EPG URL from header if present */
-      char *tvg_url = extract_tvg_url(line);
+      char *tvg_url = m3u_extract_tvg_url(line);
       if (tvg_url) {
         logger(LOG_INFO, "Found EPG URL in M3U header: %s", tvg_url);
 
@@ -1312,7 +1327,7 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
 
       /* Extract service name */
       char base_name[MAX_SERVICE_NAME];
-      if (extract_service_name(line, base_name, sizeof(base_name)) != 0) {
+      if (m3u_extract_service_name(line, base_name, sizeof(base_name)) != 0) {
         logger(LOG_WARN, "Failed to extract service name from EXTINF line");
         in_entry = 0;
         continue;
@@ -1321,7 +1336,8 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
       current_extinf.title[sizeof(current_extinf.title) - 1] = '\0';
 
       /* Extract group-title if present */
-      if (extract_attribute(line, "group-title", current_extinf.group_title, sizeof(current_extinf.group_title)) == 0 &&
+      if (m3u_extract_attribute(line, "group-title", current_extinf.group_title, sizeof(current_extinf.group_title)) ==
+              0 &&
           current_extinf.group_title[0] != '\0') {
         /* Build service name as "group-title/service-name" */
         size_t group_len = strlen(current_extinf.group_title);
@@ -1350,12 +1366,12 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
       }
 
       /* Extract catchup-source if present */
-      if (extract_attribute(line, "catchup-source", current_extinf.catchup_source,
-                            sizeof(current_extinf.catchup_source)) == 0) {
+      if (m3u_extract_attribute(line, "catchup-source", current_extinf.catchup_source,
+                                sizeof(current_extinf.catchup_source)) == 0) {
         current_extinf.has_catchup = 1;
       }
       char catchup_days[64];
-      if (extract_attribute(line, "catchup-days", catchup_days, sizeof(catchup_days)) == 0) {
+      if (m3u_extract_attribute(line, "catchup-days", catchup_days, sizeof(catchup_days)) == 0) {
         char *end = NULL;
         errno = 0;
         double days = strtod(catchup_days, &end);

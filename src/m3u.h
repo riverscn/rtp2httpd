@@ -58,6 +58,14 @@ int m3u_parse_and_create_services(const char *content, const char *source_url);
  */
 int m3u_is_header(const char *line);
 
+/* Shared M3U lexical primitives used by both the server parser and the
+ * RefPlayer one-shot direct parser. */
+char *m3u_extract_tvg_url(const char *line);
+int m3u_extract_attribute_at(const char *line, const char *attr_name, size_t occurrence, char *value,
+                             size_t value_size);
+int m3u_extract_attribute(const char *line, const char *attr_name, char *value, size_t value_size);
+int m3u_extract_service_name(const char *line, char *name, size_t name_size);
+
 /* Get the transformed M3U playlist
  * Returns: transformed M3U content (static buffer, valid until next parse)
  */
