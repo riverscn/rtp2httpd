@@ -1638,7 +1638,10 @@ cleanup:
 
 service_t *service_create_refplayer_rtsp_archive(service_t *configured_service, const char *source_id,
                                                  const char *observation_id, service_refplayer_range_kind_t kind,
-                                                 double npt_target, int64_t clock_target) {
+                                                 double npt_target, int64_t clock_target,
+                                                 int clock_observation_open_ended,
+                                                 int64_t clock_observed_at,
+                                                 int clock_timezone_offset_seconds) {
   service_t *result;
   if (!configured_service || configured_service->service_type != SERVICE_RTSP || !source_id || !observation_id ||
       (kind != SERVICE_REFPLAYER_RANGE_NPT && kind != SERVICE_REFPLAYER_RANGE_CLOCK))
@@ -1651,6 +1654,9 @@ service_t *service_create_refplayer_rtsp_archive(service_t *configured_service, 
   result->refplayer_range_kind = kind;
   result->refplayer_npt_target = npt_target;
   result->refplayer_clock_target = clock_target;
+  result->refplayer_clock_observation_open_ended = clock_observation_open_ended;
+  result->refplayer_clock_observed_at = clock_observed_at;
+  result->refplayer_clock_timezone_offset_seconds = clock_timezone_offset_seconds;
   result->refplayer_archive_request = 1;
   return result;
 }
@@ -2058,6 +2064,9 @@ service_t *service_clone(service_t *service) {
   cloned->refplayer_range_kind = service->refplayer_range_kind;
   cloned->refplayer_npt_target = service->refplayer_npt_target;
   cloned->refplayer_clock_target = service->refplayer_clock_target;
+  cloned->refplayer_clock_observation_open_ended = service->refplayer_clock_observation_open_ended;
+  cloned->refplayer_clock_observed_at = service->refplayer_clock_observed_at;
+  cloned->refplayer_clock_timezone_offset_seconds = service->refplayer_clock_timezone_offset_seconds;
   cloned->refplayer_archive_request = service->refplayer_archive_request;
 
   if (service->user_agent) {

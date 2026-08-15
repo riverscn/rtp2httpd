@@ -462,6 +462,9 @@ static int stream_init_rtsp_control(stream_context_t *ctx, service_t *service, i
     ctx->rtsp.refplayer_range_kind = service->refplayer_range_kind;
     ctx->rtsp.refplayer_npt_target = service->refplayer_npt_target;
     ctx->rtsp.refplayer_clock_target = service->refplayer_clock_target;
+    ctx->rtsp.refplayer_clock_observed_at = service->refplayer_clock_observed_at;
+    ctx->rtsp.refplayer_clock_timezone_offset_seconds = service->refplayer_clock_timezone_offset_seconds;
+    ctx->rtsp.refplayer_clock_observation_open_ended = service->refplayer_clock_observation_open_ended;
     snprintf(ctx->rtsp.refplayer_observation_id, sizeof(ctx->rtsp.refplayer_observation_id), "%s",
              service->refplayer_observation_id);
   }

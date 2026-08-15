@@ -170,6 +170,12 @@ typedef struct {
   service_refplayer_range_kind_t refplayer_range_kind;
   double refplayer_npt_target;
   int64_t refplayer_clock_target;
+  int64_t refplayer_clock_observed_at;
+  int refplayer_clock_timezone_offset_seconds;
+  int refplayer_clock_observation_open_ended;
+  int refplayer_archive_clamp_learned;
+  int64_t refplayer_archive_clamp_clock_start;
+  int64_t refplayer_archive_clamp_clock_end;
   int refplayer_play_range_valid;
   int refplayer_play_range_invalid;
   service_refplayer_range_kind_t refplayer_play_range_kind;

@@ -1316,7 +1316,7 @@ int connection_route_and_start(connection_t *c) {
           return 0;
         }
         service = service_create_refplayer_rtsp_archive(service, archive_source, observation_id,
-                                                        SERVICE_REFPLAYER_RANGE_NPT, npt_target, 0);
+                                                        SERVICE_REFPLAYER_RANGE_NPT, npt_target, 0, 0, 0, 0);
       } else if (strcmp(kind, "clock") == 0) {
         if (refplayer_rtsp_parse_clock_target(target, &clock_target) != 0 ||
             !refplayer_rtsp_clock_target_is_valid(&observation, clock_target) ||
@@ -1328,7 +1328,10 @@ int connection_route_and_start(connection_t *c) {
         }
         service = service_create_refplayer_rtsp_archive(service, archive_source, observation_id,
                                                         SERVICE_REFPLAYER_RANGE_CLOCK, 0,
-                                                        clock_target + wire_timezone_offset);
+                                                        clock_target + wire_timezone_offset,
+                                                        observation.clock_open_ended,
+                                                        observation.observed_at_epoch,
+                                                        wire_timezone_offset);
       } else {
         http_send_400(c);
         return 0;

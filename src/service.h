@@ -88,6 +88,9 @@ typedef struct service_s {
   service_refplayer_range_kind_t refplayer_range_kind;
   double refplayer_npt_target;
   int64_t refplayer_clock_target;
+  int64_t refplayer_clock_observed_at;
+  int refplayer_clock_timezone_offset_seconds;
+  int refplayer_clock_observation_open_ended;
   int refplayer_archive_request;
   char *user_agent;                /* User-Agent header for timezone detection */
   char *ifname;                    /* Per-service upstream interface override (from r2h-ifname) */
@@ -254,7 +257,10 @@ service_t *service_create_refplayer_catchup(service_t *configured_service, const
  * No query-string control is ever added to the upstream URL. */
 service_t *service_create_refplayer_rtsp_archive(service_t *configured_service, const char *source_id,
                                                  const char *observation_id, service_refplayer_range_kind_t kind,
-                                                 double npt_target, int64_t clock_target);
+                                                 double npt_target, int64_t clock_target,
+                                                 int clock_observation_open_ended,
+                                                 int64_t clock_observed_at,
+                                                 int clock_timezone_offset_seconds);
 
 /**
  * Clone a service structure (deep copy)

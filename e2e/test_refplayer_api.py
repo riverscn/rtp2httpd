@@ -156,10 +156,7 @@ class TestRefPlayerRTSPTimeshift:
             time.gmtime(target + timezone_offset),
         )
         acknowledged_clock = wire_clock[:-1] + ".32Z"
-        sdp = (
-            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=live\r\nt=0 0\r\n"
-            "a=range:clock=0-\r\nm=video 0 MP2T/AVP 33\r\n"
-        )
+        sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=live\r\nt=0 0\r\na=range:clock=0-\r\nm=video 0 MP2T/AVP 33\r\n"
         rtsp = MockRTSPServer(
             num_packets=500,
             custom_sdp=sdp,
@@ -215,12 +212,150 @@ rtsp://127.0.0.1:{rtsp.port}/stream
             assert status == 200
             media_url = json.loads(body)["media_url"]
             assert f"r2h-refplayer-rtsp-timezone-offset={timezone_offset}" in media_url
-            status, _, body = stream_get(
-                "127.0.0.1", port, _request_path(media_url), read_bytes=4096, timeout=15
-            )
+            status, _, body = stream_get("127.0.0.1", port, _request_path(media_url), read_bytes=4096, timeout=15)
             assert status == 200 and body
             play_requests = [request for request in rtsp.requests_detailed if request["method"] == "PLAY"]
             assert play_requests[-1]["headers"]["Range"] == f"clock={wire_clock}-"
+        finally:
+            process.stop()
+            rtsp.stop()
+
+    def test_open_clock_archive_learns_a_safe_forward_clamp(self, r2h_binary):
+        now = int(time.time())
+        requested_actual = now - 6 * 3600
+        clamped_actual = now - 4 * 3600
+        timezone_offset = 8 * 3600
+        clamped_wire = time.strftime(
+            "%Y%m%dT%H%M%SZ",
+            time.gmtime(clamped_actual + timezone_offset),
+        )
+        sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=live\r\nt=0 0\r\na=range:clock=0-\r\nm=video 0 MP2T/AVP 33\r\n"
+        rtsp = MockRTSPServer(
+            num_packets=500,
+            custom_sdp=sdp,
+            play_response_headers_sequence=[
+                [],
+                [("Range", f"clock={clamped_wire}-")],
+            ],
+        )
+        rtsp.start()
+        port = find_free_port()
+        token = "12121212121212121212121212121212"
+        services = f"""#EXTM3U
+#EXTINF:-1,Clamped Clock
+rtsp://127.0.0.1:{rtsp.port}/stream
+"""
+        env = os.environ.copy()
+        env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+        process = R2HProcess(
+            r2h_binary,
+            port,
+            config_content=_base_config(port, services, global_lines=f"workers = 1\nr2h-token = {token}"),
+            env=env,
+        )
+        try:
+            process.start()
+            channel = _catalog(port, f"/api/refplayer/v1/catalog?r2h-token={token}")["channels"][0]
+            status, _, body = stream_get(
+                "127.0.0.1", port, _request_path(channel["live_url"]), read_bytes=4096, timeout=15
+            )
+            assert status == 200 and body
+            discover_path = f"/api/refplayer/v1/rtsp-timeshift?r2h-token={token}&source_id={channel['id']}"
+            status, _, body = http_get("127.0.0.1", port, discover_path)
+            capability = json.loads(body)["capability"]
+            assert status == 200 and capability["range"]["open_ended"] is True
+            resolve_path = (
+                f"/api/refplayer/v1/rtsp-timeshift/resolve?r2h-token={token}"
+                f"&source_id={channel['id']}&observation_id={capability['observation_id']}"
+                f"&kind=clock&target_epoch={requested_actual}&timezone_offset_seconds={timezone_offset}"
+            )
+            status, _, body = http_get("127.0.0.1", port, resolve_path)
+            assert status == 200
+            status, _, archive_body = stream_get(
+                "127.0.0.1",
+                port,
+                _request_path(json.loads(body)["media_url"]),
+                read_bytes=4096,
+                timeout=15,
+            )
+            assert status == 200 and archive_body
+
+            deadline = time.monotonic() + 2
+            learned = None
+            while time.monotonic() < deadline:
+                status, _, body = http_get("127.0.0.1", port, discover_path)
+                learned = json.loads(body)["capability"]
+                if learned and learned["range"].get("open_ended") is not True:
+                    break
+                time.sleep(0.02)
+            assert status == 200
+            assert learned["range"] == {
+                "kind": "clock",
+                "start_epoch": clamped_actual,
+                "end_epoch": capability["observed_at_epoch"],
+            }
+        finally:
+            process.stop()
+            rtsp.stop()
+
+    @pytest.mark.parametrize("ack_delta", [-(3 * 3600), 3600])
+    def test_open_clock_archive_rejects_unsafe_clamps(self, r2h_binary, ack_delta):
+        now = int(time.time())
+        requested_actual = now - 2 * 3600
+        timezone_offset = 8 * 3600
+        acknowledged_wire = time.strftime(
+            "%Y%m%dT%H%M%SZ",
+            time.gmtime(now + ack_delta + timezone_offset),
+        )
+        sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=live\r\nt=0 0\r\na=range:clock=0-\r\nm=video 0 MP2T/AVP 33\r\n"
+        rtsp = MockRTSPServer(
+            num_packets=500,
+            custom_sdp=sdp,
+            play_response_headers_sequence=[
+                [],
+                [("Range", f"clock={acknowledged_wire}-")],
+            ],
+        )
+        rtsp.start()
+        port = find_free_port()
+        token = f"{ack_delta & ((1 << 128) - 1):032x}"
+        services = f"""#EXTM3U
+#EXTINF:-1,Unsafe Clock Clamp
+rtsp://127.0.0.1:{rtsp.port}/stream
+"""
+        env = os.environ.copy()
+        env["RTP2HTTPD_REFPLAYER_TIMESHIFT"] = "1"
+        process = R2HProcess(
+            r2h_binary,
+            port,
+            config_content=_base_config(port, services, global_lines=f"workers = 1\nr2h-token = {token}"),
+            env=env,
+        )
+        try:
+            process.start()
+            channel = _catalog(port, f"/api/refplayer/v1/catalog?r2h-token={token}")["channels"][0]
+            status, _, body = stream_get(
+                "127.0.0.1", port, _request_path(channel["live_url"]), read_bytes=4096, timeout=15
+            )
+            assert status == 200 and body
+            discover_path = f"/api/refplayer/v1/rtsp-timeshift?r2h-token={token}&source_id={channel['id']}"
+            status, _, body = http_get("127.0.0.1", port, discover_path)
+            capability = json.loads(body)["capability"]
+            resolve_path = (
+                f"/api/refplayer/v1/rtsp-timeshift/resolve?r2h-token={token}"
+                f"&source_id={channel['id']}&observation_id={capability['observation_id']}"
+                f"&kind=clock&target_epoch={requested_actual}&timezone_offset_seconds={timezone_offset}"
+            )
+            status, _, body = http_get("127.0.0.1", port, resolve_path)
+            assert status == 200
+            status, _, _ = stream_get(
+                "127.0.0.1",
+                port,
+                _request_path(json.loads(body)["media_url"]),
+                read_bytes=4096,
+                timeout=15,
+            )
+            assert status != 200
         finally:
             process.stop()
             rtsp.stop()
