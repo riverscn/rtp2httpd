@@ -60,6 +60,25 @@ typedef struct {
 
 static int refplayer_query_token_matches(const refplayer_query_field_t *field);
 
+static int refplayer_parse_timezone_offset(const char *value, int *offset) {
+  char *end = NULL;
+  long parsed;
+  if (!value || !offset || !value[0] || value[0] == '+' ||
+      (value[0] == '-' && !value[1]) ||
+      (value[0] == '0' && value[1]) ||
+      (value[0] == '-' && value[1] == '0'))
+    return -1;
+  for (const char *cursor = value + (value[0] == '-'); *cursor; cursor++)
+    if (!isdigit((unsigned char)*cursor))
+      return -1;
+  errno = 0;
+  parsed = strtol(value, &end, 10);
+  if (errno || !end || *end || parsed < -43200 || parsed > 50400)
+    return -1;
+  *offset = (int)parsed;
+  return 0;
+}
+
 /* Private API and archive controls deliberately do not inherit the daemon's
  * case-insensitive, first-match query semantics. Names must be literal ASCII,
  * unique and unencoded; values are copied raw for typed validation. */
@@ -1261,8 +1280,10 @@ int connection_route_and_start(connection_t *c) {
       char observation_id[REFPLAYER_RTSP_OBSERVATION_ID_SIZE];
       char kind[16];
       char target[64];
+      char timezone_offset[16];
       double npt_target = 0;
       int64_t clock_target = 0;
+      int wire_timezone_offset = 0;
       refplayer_rtsp_observation_t observation;
       const m3u_catalog_channel_t *catalog_source = m3u_catalog_find_live_service(decoded_path);
       refplayer_query_field_t fields[] = {
@@ -1271,6 +1292,7 @@ int connection_route_and_start(connection_t *c) {
           {"r2h-refplayer-rtsp-observation", observation_id, sizeof(observation_id), 1, 0},
           {"r2h-refplayer-rtsp-kind", kind, sizeof(kind), 1, 0},
           {"r2h-refplayer-rtsp-target", target, sizeof(target), 1, 0},
+          {"r2h-refplayer-rtsp-timezone-offset", timezone_offset, sizeof(timezone_offset), 0, 0},
       };
 
       if (strcmp(c->http_req.method, "GET") != 0 || !refplayer_rtsp_timeshift_enabled() ||
@@ -1288,7 +1310,7 @@ int connection_route_and_start(connection_t *c) {
         return 0;
       }
       if (strcmp(kind, "npt") == 0) {
-        if (refplayer_rtsp_parse_npt_target(target, &npt_target) != 0 ||
+        if (fields[5].seen || refplayer_rtsp_parse_npt_target(target, &npt_target) != 0 ||
             !refplayer_rtsp_npt_target_is_valid(&observation, npt_target)) {
           http_send_416(c);
           return 0;
@@ -1297,12 +1319,16 @@ int connection_route_and_start(connection_t *c) {
                                                         SERVICE_REFPLAYER_RANGE_NPT, npt_target, 0);
       } else if (strcmp(kind, "clock") == 0) {
         if (refplayer_rtsp_parse_clock_target(target, &clock_target) != 0 ||
-            !refplayer_rtsp_clock_target_is_valid(&observation, clock_target)) {
+            !refplayer_rtsp_clock_target_is_valid(&observation, clock_target) ||
+            (fields[5].seen && refplayer_parse_timezone_offset(timezone_offset, &wire_timezone_offset) != 0) ||
+            (wire_timezone_offset > 0 && clock_target > INT64_MAX - wire_timezone_offset) ||
+            (wire_timezone_offset < 0 && clock_target < -wire_timezone_offset)) {
           http_send_416(c);
           return 0;
         }
         service = service_create_refplayer_rtsp_archive(service, archive_source, observation_id,
-                                                        SERVICE_REFPLAYER_RANGE_CLOCK, 0, clock_target);
+                                                        SERVICE_REFPLAYER_RANGE_CLOCK, 0,
+                                                        clock_target + wire_timezone_offset);
       } else {
         http_send_400(c);
         return 0;
@@ -1646,13 +1672,22 @@ static void handle_refplayer_rtsp_timeshift_request(connection_t *c, const char 
              source_id, observation.observation_id, (long long)observation.observed_at_epoch,
              (long long)observation.expires_at_epoch, start, end);
   } else {
-    snprintf(response, sizeof(response),
-             "{\"schema_version\":2,\"source_id\":\"%s\",\"capability\":{"
-             "\"observation_id\":\"%s\",\"observed_at_epoch\":%lld,\"expires_at_epoch\":%lld,"
-             "\"range\":{\"kind\":\"clock\",\"start_epoch\":%lld,\"end_epoch\":%lld}}}",
-             source_id, observation.observation_id, (long long)observation.observed_at_epoch,
-             (long long)observation.expires_at_epoch, (long long)observation.clock_start_epoch,
-             (long long)observation.clock_end_epoch);
+    if (observation.clock_open_ended)
+      snprintf(response, sizeof(response),
+               "{\"schema_version\":2,\"source_id\":\"%s\",\"capability\":{"
+               "\"observation_id\":\"%s\",\"observed_at_epoch\":%lld,\"expires_at_epoch\":%lld,"
+               "\"range\":{\"kind\":\"clock\",\"open_ended\":true,"
+               "\"maximum_lookback_seconds\":%d}}}",
+               source_id, observation.observation_id, (long long)observation.observed_at_epoch,
+               (long long)observation.expires_at_epoch, REFPLAYER_RTSP_OPEN_CLOCK_LOOKBACK_SECONDS);
+    else
+      snprintf(response, sizeof(response),
+               "{\"schema_version\":2,\"source_id\":\"%s\",\"capability\":{"
+               "\"observation_id\":\"%s\",\"observed_at_epoch\":%lld,\"expires_at_epoch\":%lld,"
+               "\"range\":{\"kind\":\"clock\",\"start_epoch\":%lld,\"end_epoch\":%lld}}}",
+               source_id, observation.observation_id, (long long)observation.observed_at_epoch,
+               (long long)observation.expires_at_epoch, (long long)observation.clock_start_epoch,
+               (long long)observation.clock_end_epoch);
   }
   send_refplayer_json(c, STATUS_200, response);
 }
@@ -1664,11 +1699,13 @@ static void handle_refplayer_rtsp_timeshift_resolve_request(connection_t *c, con
   char kind[16];
   char target_seconds[64];
   char target_epoch[32];
+  char timezone_offset[16];
   char canonical_target[64];
   char media_url[HTTP_URL_BUFFER_SIZE * 2];
   char response[HTTP_URL_BUFFER_SIZE * 3];
   double npt_target = 0;
   int64_t clock_target = 0;
+  int wire_timezone_offset = 0;
   refplayer_rtsp_observation_t observation;
   const m3u_catalog_channel_t *channel;
   service_t *configured;
@@ -1684,6 +1721,7 @@ static void handle_refplayer_rtsp_timeshift_resolve_request(connection_t *c, con
       {"kind", kind, sizeof(kind), 1, 0},
       {"target_seconds", target_seconds, sizeof(target_seconds), 0, 0},
       {"target_epoch", target_epoch, sizeof(target_epoch), 0, 0},
+      {"timezone_offset_seconds", timezone_offset, sizeof(timezone_offset), 0, 0},
   };
 
   if (!c)
@@ -1697,9 +1735,13 @@ static void handle_refplayer_rtsp_timeshift_resolve_request(connection_t *c, con
       refplayer_rtsp_parse_observation_id(observation_id) != 0 ||
       ((strcmp(kind, "npt") == 0) == (strcmp(kind, "clock") == 0)) ||
       (strcmp(kind, "npt") == 0 && (!fields[4].seen || fields[5].seen ||
+                                     fields[6].seen ||
                                      refplayer_rtsp_parse_npt_target(target_seconds, &npt_target) != 0)) ||
       (strcmp(kind, "clock") == 0 && (!fields[5].seen || fields[4].seen ||
-                                       refplayer_rtsp_parse_clock_target(target_epoch, &clock_target) != 0))) {
+                                       refplayer_rtsp_parse_clock_target(target_epoch, &clock_target) != 0 ||
+                                       (fields[6].seen &&
+                                        refplayer_parse_timezone_offset(timezone_offset,
+                                                                        &wire_timezone_offset) != 0)))) {
     send_refplayer_json(c, STATUS_400, "{\"schema_version\":2,\"error\":\"invalid_query\"}");
     return;
   }
@@ -1729,7 +1771,14 @@ static void handle_refplayer_rtsp_timeshift_resolve_request(connection_t *c, con
   encoded_token = http_url_encode(config.r2h_token);
   media_url_length = (!base_url || !encoded_name || !encoded_token)
                          ? -1
-                         : snprintf(media_url, sizeof(media_url),
+                         : fields[6].seen
+                               ? snprintf(media_url, sizeof(media_url),
+                                    "%s%s?r2h-token=%s&r2h-refplayer-rtsp-source=%s&"
+                                    "r2h-refplayer-rtsp-observation=%s&r2h-refplayer-rtsp-kind=%s&"
+                                    "r2h-refplayer-rtsp-target=%s&r2h-refplayer-rtsp-timezone-offset=%s",
+                                    base_url, encoded_name, encoded_token, source_id, observation_id, kind,
+                                    canonical_target, timezone_offset)
+                               : snprintf(media_url, sizeof(media_url),
                                     "%s%s?r2h-token=%s&r2h-refplayer-rtsp-source=%s&"
                                     "r2h-refplayer-rtsp-observation=%s&r2h-refplayer-rtsp-kind=%s&"
                                     "r2h-refplayer-rtsp-target=%s",

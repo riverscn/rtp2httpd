@@ -9,6 +9,7 @@
 #define REFPLAYER_RTSP_OBSERVATION_ID_SIZE 33
 #define REFPLAYER_RTSP_OBSERVATION_TTL_SECONDS 600
 #define REFPLAYER_RTSP_SESSION_ID_SIZE 33
+#define REFPLAYER_RTSP_OPEN_CLOCK_LOOKBACK_SECONDS 604800
 
 typedef enum {
   REFPLAYER_RTSP_RANGE_NONE = 0,
@@ -24,6 +25,11 @@ typedef struct {
   double npt_end;
   int64_t clock_start_epoch;
   int64_t clock_end_epoch;
+  /* The upstream proved that the live session accepts the RTSP clock
+   * coordinate, but did not advertise a finite retention window. RefPlayer
+   * bounds requests to the product lookback above without presenting it as
+   * source-proven retention. */
+  int clock_open_ended;
   int64_t observed_at_epoch;
   int64_t expires_at_epoch;
   /* Authority for expiry; the wall-clock fields above are display only. */
@@ -38,6 +44,11 @@ void refplayer_rtsp_timeshift_clear(void);
 /* Parse an upstream PLAY Range value. Only complete, finite ranges are
  * accepted. Clock endpoints must carry an explicit timezone. */
 int refplayer_rtsp_parse_play_range(const char *value, refplayer_rtsp_observation_t *range);
+
+/* Recognize the open live-clock form used by IPTV servers (notably
+ * ``clock=0-``). It proves a coordinate only, never a retention window. */
+int refplayer_rtsp_parse_open_clock_range(const char *value,
+                                          refplayer_rtsp_observation_t *range);
 
 /* Archive PLAY replies are acknowledgements, not source-window evidence. A
  * server may acknowledge the requested seek as either a finite range or an

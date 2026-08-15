@@ -218,12 +218,25 @@ static int parse_compact_clock(const char *value, size_t *consumed, int64_t *epo
   char buffer[17];
   char *end;
   time_t result;
-  if (!value || strlen(value) < 16 || value[8] != 'T' || value[15] != 'Z')
+  size_t length;
+  size_t z_index = 15;
+  if (!value || strlen(value) < 16 || value[8] != 'T')
     return -1;
-  for (size_t index = 0; index < 16; index++)
-    if (index != 8 && index != 15 && !isdigit((unsigned char)value[index]))
+  for (size_t index = 0; index < 15; index++)
+    if (index != 8 && !isdigit((unsigned char)value[index]))
       return -1;
-  memcpy(buffer, value, 16);
+  if (value[15] == '.') {
+    z_index = 16;
+    while (z_index < 25 && isdigit((unsigned char)value[z_index]))
+      z_index++;
+    if (z_index == 16)
+      return -1;
+  }
+  if (value[z_index] != 'Z')
+    return -1;
+  length = z_index + 1;
+  memcpy(buffer, value, 15);
+  buffer[15] = 'Z';
   buffer[16] = '\0';
   memset(&parsed, 0, sizeof(parsed));
   end = strptime(buffer, "%Y%m%dT%H%M%SZ", &parsed);
@@ -233,7 +246,7 @@ static int parse_compact_clock(const char *value, size_t *consumed, int64_t *epo
   result = timegm(&parsed);
   if (result < 0 || (uint64_t)result > UINT64_C(253402300799) || !calendar_round_trips(&original, result))
     return -1;
-  *consumed = 16;
+  *consumed = length;
   *epoch = (int64_t)result;
   return 0;
 }
@@ -390,6 +403,20 @@ int refplayer_rtsp_parse_play_range(const char *value, refplayer_rtsp_observatio
     return 0;
   }
   return -1;
+}
+
+int refplayer_rtsp_parse_open_clock_range(const char *value,
+                                          refplayer_rtsp_observation_t *range) {
+  if (!value || !range)
+    return -1;
+  while (*value == ' ' || *value == '\t')
+    value++;
+  if (strcmp(value, "clock=0-") != 0)
+    return -1;
+  memset(range, 0, sizeof(*range));
+  range->kind = REFPLAYER_RTSP_RANGE_CLOCK;
+  range->clock_open_ended = 1;
+  return 0;
 }
 
 int refplayer_rtsp_parse_archive_ack(const char *value, refplayer_rtsp_observation_t *range,
@@ -553,6 +580,10 @@ int refplayer_rtsp_npt_target_is_valid(const refplayer_rtsp_observation_t *obser
 }
 
 int refplayer_rtsp_clock_target_is_valid(const refplayer_rtsp_observation_t *observation, int64_t target) {
-  return observation && observation->kind == REFPLAYER_RTSP_RANGE_CLOCK && target >= observation->clock_start_epoch &&
-         target <= observation->clock_end_epoch;
+  if (!observation || observation->kind != REFPLAYER_RTSP_RANGE_CLOCK)
+    return 0;
+  if (observation->clock_open_ended)
+    return target >= observation->observed_at_epoch - REFPLAYER_RTSP_OPEN_CLOCK_LOOKBACK_SECONDS &&
+           target <= observation->observed_at_epoch;
+  return target >= observation->clock_start_epoch && target <= observation->clock_end_epoch;
 }

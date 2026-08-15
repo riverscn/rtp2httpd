@@ -186,6 +186,7 @@ typedef struct {
   int64_t refplayer_archive_ack_clock_start;
   int64_t refplayer_archive_ack_clock_end;
   int refplayer_sdp_range_valid;
+  int refplayer_sdp_clock_open_ended;
   service_refplayer_range_kind_t refplayer_sdp_range_kind;
   double refplayer_sdp_npt_start;
   double refplayer_sdp_npt_end;

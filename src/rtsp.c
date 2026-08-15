@@ -80,6 +80,7 @@ static void rtsp_clear_refplayer_sdp_range(rtsp_session_t *session) {
   if (!session)
     return;
   session->refplayer_sdp_range_valid = 0;
+  session->refplayer_sdp_clock_open_ended = 0;
   session->refplayer_sdp_range_kind = SERVICE_REFPLAYER_RANGE_NONE;
   session->refplayer_sdp_npt_start = 0;
   session->refplayer_sdp_npt_end = 0;
@@ -171,6 +172,8 @@ static void rtsp_finalize_refplayer_http_commit(rtsp_session_t *session, connect
                                                         : session->refplayer_sdp_npt_end;
   } else if (kind == SERVICE_REFPLAYER_RANGE_CLOCK) {
     range.kind = REFPLAYER_RTSP_RANGE_CLOCK;
+    range.clock_open_ended = !session->refplayer_play_range_valid &&
+                             session->refplayer_sdp_clock_open_ended;
     range.clock_start_epoch = session->refplayer_play_range_valid ? session->refplayer_play_clock_start
                                                                   : session->refplayer_sdp_clock_start;
     range.clock_end_epoch = session->refplayer_play_range_valid ? session->refplayer_play_clock_end
@@ -3495,7 +3498,8 @@ static int rtsp_refplayer_ranges_equal(const refplayer_rtsp_observation_t *left,
   if (left->kind == REFPLAYER_RTSP_RANGE_NPT)
     return left->npt_start == right->npt_start && left->npt_end == right->npt_end;
   if (left->kind == REFPLAYER_RTSP_RANGE_CLOCK)
-    return left->clock_start_epoch == right->clock_start_epoch &&
+    return left->clock_open_ended == right->clock_open_ended &&
+           left->clock_start_epoch == right->clock_start_epoch &&
            left->clock_end_epoch == right->clock_end_epoch;
   return 0;
 }
@@ -3512,7 +3516,8 @@ static void rtsp_refplayer_consider_sdp_range(refplayer_rtsp_observation_t *cand
   }
   memcpy(buffer, value, value_len);
   buffer[value_len] = '\0';
-  if (refplayer_rtsp_parse_play_range(buffer, &parsed) != 0) {
+  if (refplayer_rtsp_parse_play_range(buffer, &parsed) != 0 &&
+      refplayer_rtsp_parse_open_clock_range(buffer, &parsed) != 0) {
     *conflict = 1;
     return;
   }
@@ -3579,6 +3584,7 @@ static void rtsp_parse_refplayer_sdp_range(rtsp_session_t *session, const char *
     session->refplayer_sdp_npt_end = selected->npt_end;
   } else if (selected->kind == REFPLAYER_RTSP_RANGE_CLOCK) {
     session->refplayer_sdp_range_kind = SERVICE_REFPLAYER_RANGE_CLOCK;
+    session->refplayer_sdp_clock_open_ended = selected->clock_open_ended;
     session->refplayer_sdp_clock_start = selected->clock_start_epoch;
     session->refplayer_sdp_clock_end = selected->clock_end_epoch;
   }
