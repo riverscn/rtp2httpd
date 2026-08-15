@@ -111,7 +111,7 @@ https://edge.example.test/news-low.m3u8$SD
     }
 
 
-def test_native_rtp_udp_stay_direct_and_rtsp_becomes_helper_candidate(r2h_binary):
+def test_native_rtp_udp_rtsp_are_all_helper_candidates(r2h_binary):
     base_url = "http://iptv.example.test/playlist.m3u"
     raw_live = """\
 #EXTM3U
@@ -126,14 +126,20 @@ udp://239.1.1.2:1234
         _catalog_frame(base_url, raw_live),
     )
     assert returncode == 0
-    assert payload["mode"] == "direct"
-    assert payload["reason"] is None
-    assert payload["proxy_m3u"] is None
+    assert payload["mode"] == "mixed"
+    assert payload["reason"] == "live_source_requires_helper"
     assert [channel["sources"][0]["live_url"] for channel in payload["channels"]] == [
         "rtp://239.1.1.1:1234",
         "udp://239.1.1.2:1234",
     ]
-    assert [channel["sources"][0]["live_route"] for channel in payload["channels"]] == ["direct", "direct"]
+    assert [channel["sources"][0]["live_route"] for channel in payload["channels"]] == ["helper", "helper"]
+    assert payload["proxy_m3u"] == (
+        '#EXTM3U\n#EXTINF:-1 refplayer-source-id="%s",refplayer-rtsp\n'
+        "rtp://239.1.1.1:1234\n"
+        '#EXTINF:-1 refplayer-source-id="%s",refplayer-rtsp\n'
+        "udp://239.1.1.2:1234\n"
+        % (payload["channels"][0]["sources"][0]["id"], payload["channels"][1]["sources"][0]["id"])
+    )
 
     native_catchup = """\
 #EXTM3U
@@ -146,10 +152,10 @@ rtp://239.1.1.1:1234
         _catalog_frame(base_url, native_catchup),
     )
     assert returncode == 0
-    assert payload["mode"] == "direct"
+    assert payload["mode"] == "mixed"
     source = payload["channels"][0]["sources"][0]
-    assert source["live_route"] == "direct"
-    assert source["catchup_route"] == "direct"
+    assert source["live_route"] == "helper"
+    assert source["catchup_route"] == "helper"
     returncode, resolved = _run(
         r2h_binary,
         "--refplayer-direct-resolve",
@@ -170,10 +176,10 @@ rtsp://iptv.example.test/live
     )
     assert returncode == 0
     assert payload["mode"] == "mixed"
-    assert payload["reason"] == "live_source_rtsp_candidate"
+    assert payload["reason"] == "live_source_requires_helper"
     source = payload["channels"][0]["sources"][0]
     assert source["live_url"] == "rtsp://iptv.example.test/live"
-    assert source["live_route"] == "rtsp_helper_candidate"
+    assert source["live_route"] == "helper"
     assert source["catchup_route"] is None
     assert payload["proxy_m3u"] == (
         '#EXTM3U\n#EXTINF:-1 refplayer-source-id="%s",refplayer-rtsp\n'
@@ -192,8 +198,8 @@ rtsp://iptv.example.test/live
     )
     assert returncode == 0
     source = payload["channels"][0]["sources"][0]
-    assert source["live_route"] == "rtsp_helper_candidate"
-    assert source["catchup_route"] == "rtsp_helper_candidate"
+    assert source["live_route"] == "helper"
+    assert source["catchup_route"] == "helper"
     assert payload["proxy_m3u"] == (
         '#EXTM3U\n#EXTINF:-1 refplayer-source-id="%s" catchup="default" '
         'catchup-source="rtsp://iptv.example.test/live?playseek=${(b)timestamp}-${(e)timestamp}",refplayer-rtsp\n'
@@ -219,10 +225,10 @@ https://media.example.test/live.m3u8
     )
     assert returncode == 0
     assert payload["mode"] == "mixed"
-    assert payload["reason"] == "catchup_source_rtsp_candidate"
+    assert payload["reason"] == "catchup_source_requires_helper"
     source = payload["channels"][0]["sources"][0]
     assert source["live_route"] == "direct"
-    assert source["catchup_route"] == "rtsp_helper_candidate"
+    assert source["catchup_route"] == "helper"
     assert source["catchup"] == {
         "source_id": source["id"],
         "mode": "default",
@@ -272,7 +278,7 @@ https://media.example.test/live.m3u8
         source
         for channel in payload["channels"]
         for source in channel["sources"]
-        if source["live_route"] == "rtsp_helper_candidate"
+        if source["live_route"] == "helper"
     ]
     assert len(candidate_sources) == 1
     proxy_m3u = payload["proxy_m3u"]
@@ -301,7 +307,7 @@ https://media.example.test/live.m3u8
     assert returncode == 0
     source = direct["channels"][0]["sources"][0]
     assert source["live_route"] == "direct"
-    assert source["catchup_route"] == "rtsp_helper_candidate"
+    assert source["catchup_route"] == "helper"
 
     port = find_free_port()
     config = f"""\

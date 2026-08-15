@@ -119,6 +119,21 @@ typedef struct {
 static int direct_json_append_proxy_m3u(direct_json_t *json, const direct_catalog_t *catalog);
 
 static int direct_url_has_unsafe_byte(const char *url);
+static int direct_is_native_url(const char *url);
+static int direct_is_rtsp_url(const char *url);
+static int direct_validate_absolute_rtsp_url(const char *url);
+
+static int direct_kind_uses_helper(direct_url_kind_t kind) {
+  return kind == DIRECT_URL_NATIVE || kind == DIRECT_URL_RTSP_CANDIDATE;
+}
+
+static int direct_validate_helper_url(const char *url) {
+  if (!url || direct_url_has_unsafe_byte(url))
+    return -1;
+  if (direct_is_rtsp_url(url))
+    return direct_validate_absolute_rtsp_url(url);
+  return direct_is_native_url(url) ? 0 : -1;
+}
 
 static void direct_group_free(direct_group_t *group) {
   while (group) {
@@ -952,10 +967,10 @@ static int direct_add_source(direct_catalog_t *catalog, direct_channel_t *channe
   live_kind = direct_resolve_url(raw_live_url, base_url, &live_url);
   if (live_kind == DIRECT_URL_INVALID)
     return 0;
-  if (live_kind == DIRECT_URL_RTSP_CANDIDATE) {
+  if (direct_kind_uses_helper(live_kind)) {
     catalog->has_rtsp_candidates = 1;
     if (!catalog->rtsp_candidate_reason)
-      catalog->rtsp_candidate_reason = "live_source_rtsp_candidate";
+      catalog->rtsp_candidate_reason = "live_source_requires_helper";
   }
   if (has_declared_catchup) {
     if (direct_is_rtsp_url(extinf->catchup_source)) {
@@ -980,10 +995,10 @@ static int direct_add_source(direct_catalog_t *catalog, direct_channel_t *channe
       catchup_kind = direct_resolve_url(extinf->catchup_source, base_url, &catchup_template);
     }
 
-    if (catchup_kind == DIRECT_URL_RTSP_CANDIDATE) {
+    if (direct_kind_uses_helper(catchup_kind)) {
       catalog->has_rtsp_candidates = 1;
       if (!catalog->rtsp_candidate_reason)
-        catalog->rtsp_candidate_reason = "catchup_source_rtsp_candidate";
+        catalog->rtsp_candidate_reason = "catchup_source_requires_helper";
     } else if (catchup_kind == DIRECT_URL_INVALID) {
       free(catchup_template);
       catchup_template = NULL;
@@ -1251,17 +1266,17 @@ static int direct_catalog_json(const direct_catalog_t *catalog, direct_json_t *j
       DIRECT_APPEND(",\"live_url\":\"");
       DIRECT_ESCAPE(source->live_url);
       DIRECT_APPEND("\",\"live_route\":\"");
-      DIRECT_APPEND(source->live_kind == DIRECT_URL_RTSP_CANDIDATE ? "rtsp_helper_candidate" : "direct");
+      DIRECT_APPEND(direct_kind_uses_helper(source->live_kind) ? "helper" : "direct");
       DIRECT_APPEND("\",\"catchup_route\":");
-      if (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE) {
-        DIRECT_APPEND("\"rtsp_helper_candidate\"");
+      if (direct_kind_uses_helper(source->catchup_kind)) {
+        DIRECT_APPEND("\"helper\"");
       } else if (source->catchup_template) {
         DIRECT_APPEND("\"direct\"");
       } else {
         DIRECT_APPEND("null");
       }
       DIRECT_APPEND(",\"catchup\":");
-      if (!source->catchup_template && source->catchup_kind != DIRECT_URL_RTSP_CANDIDATE) {
+      if (!source->catchup_template && !direct_kind_uses_helper(source->catchup_kind)) {
         DIRECT_APPEND("null");
       } else {
         DIRECT_APPEND("{\"source_id\":\"");
@@ -1294,7 +1309,7 @@ static int direct_proxy_m3u_append_extinf(direct_json_t *json, const direct_sour
   if (direct_json_append(json, "#EXTINF:-1 refplayer-source-id=\\\"") != 0 ||
       direct_json_escape(json, source->id) != 0 || direct_json_append(json, "\\\"") != 0)
     return -1;
-  if (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE) {
+  if (direct_kind_uses_helper(source->catchup_kind)) {
     /* The Host uses this only as a private routing snapshot. Do not copy the
      * playlist's untrusted catchup-mode token into config/M3U syntax. */
     if (direct_json_append(json, " catchup=\\\"default\\\" catchup-source=\\\"") != 0 ||
@@ -1321,7 +1336,7 @@ static int direct_json_append_proxy_m3u(direct_json_t *json, const direct_catalo
 
   for (const direct_channel_t *channel = catalog->channels; channel; channel = channel->next)
     for (const direct_source_t *source = channel->sources; source; source = source->next)
-      if (source->live_kind == DIRECT_URL_RTSP_CANDIDATE || source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE)
+      if (direct_kind_uses_helper(source->live_kind) || direct_kind_uses_helper(source->catchup_kind))
         has_candidate = 1;
   if (!has_candidate)
     return direct_json_append(json, "null");
@@ -1331,12 +1346,12 @@ static int direct_json_append_proxy_m3u(direct_json_t *json, const direct_catalo
   for (const direct_channel_t *channel = catalog->channels; channel; channel = channel->next) {
     for (const direct_source_t *source = channel->sources; source; source = source->next) {
       const char *proxy_live_url;
-      if (source->live_kind != DIRECT_URL_RTSP_CANDIDATE && source->catchup_kind != DIRECT_URL_RTSP_CANDIDATE)
+      if (!direct_kind_uses_helper(source->live_kind) && !direct_kind_uses_helper(source->catchup_kind))
         continue;
-      proxy_live_url = source->live_kind == DIRECT_URL_RTSP_CANDIDATE ? source->live_url : source->catchup_template;
-      if (!proxy_live_url || direct_validate_absolute_rtsp_url(proxy_live_url) != 0 ||
-          (source->catchup_kind == DIRECT_URL_RTSP_CANDIDATE &&
-           (!source->catchup_template || direct_validate_absolute_rtsp_url(source->catchup_template) != 0)) ||
+      proxy_live_url = direct_kind_uses_helper(source->live_kind) ? source->live_url : source->catchup_template;
+      if (!proxy_live_url || direct_validate_helper_url(proxy_live_url) != 0 ||
+          (direct_kind_uses_helper(source->catchup_kind) &&
+           (!source->catchup_template || direct_validate_helper_url(source->catchup_template) != 0)) ||
           direct_proxy_m3u_append_extinf(json, source) != 0 || direct_json_escape(json, proxy_live_url) != 0 ||
           direct_json_append(json, "\\n") != 0)
         return -1;
