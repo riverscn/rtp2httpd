@@ -530,6 +530,7 @@ void refplayer_rtsp_timeshift_deactivate(const char *source_id, const char *sess
 
 int refplayer_rtsp_timeshift_discover(const char *source_id, refplayer_rtsp_observation_t *observation) {
   const refplayer_rtsp_active_fact_t *newest = NULL;
+  const refplayer_rtsp_observation_t *learned = NULL;
   if (!refplayer_rtsp_timeshift_enabled() || refplayer_rtsp_parse_source_id(source_id) != 0 || !observation)
     return -1;
   for (size_t index = 0; index < REFPLAYER_RTSP_ACTIVE_CAPACITY; index++)
@@ -537,8 +538,25 @@ int refplayer_rtsp_timeshift_discover(const char *source_id, refplayer_rtsp_obse
         (!newest || cache.active[index].sequence > newest->sequence))
       newest = &cache.active[index];
   if (!newest)
+    for (size_t offset = 0; offset < REFPLAYER_RTSP_OBSERVATION_CAPACITY; offset++) {
+      size_t index = (cache.next_slot + REFPLAYER_RTSP_OBSERVATION_CAPACITY - 1 - offset) %
+                     REFPLAYER_RTSP_OBSERVATION_CAPACITY;
+      if (strcmp(cache.observations[index].source_id, source_id) == 0 &&
+          cache.observations[index].kind != REFPLAYER_RTSP_RANGE_NONE) {
+        learned = &cache.observations[index];
+        break;
+      }
+    }
+  /* A successful live open establishes source capability for the lifetime of
+   * this isolated helper instance. Archive playback replaces that live RTSP
+   * connection, so no active-session fact remains, but subsequent seeks must
+   * still be able to mint a fresh bounded observation from the learned range. */
+  if (!newest && !learned)
     return 0;
-  return refplayer_rtsp_timeshift_publish(source_id, &newest->range, observation) == 0 ? 1 : -1;
+  return refplayer_rtsp_timeshift_publish(source_id, newest ? &newest->range : learned,
+                                          observation) == 0
+             ? 1
+             : -1;
 }
 
 int refplayer_rtsp_timeshift_latest(const char *source_id, refplayer_rtsp_observation_t *observation) {

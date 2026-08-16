@@ -483,6 +483,18 @@ rtsp://127.0.0.1:{rtsp.port}/stream
                 "start_seconds": 0,
                 "end_seconds": 600,
             }
+            # The live RTSP connection has already closed. Discovery must
+            # still mint a fresh bounded grant from the capability learned by
+            # that successful open so a later archive seek does not become the
+            # last usable seek for this helper lease.
+            status, _, refreshed_body = http_get(
+                "127.0.0.1", port, discover_path
+            )
+            refreshed = json.loads(refreshed_body)["capability"]
+            assert status == 200
+            assert refreshed["observation_id"] != capability["observation_id"]
+            assert refreshed["range"] == capability["range"]
+            capability = refreshed
 
             resolve_path = (
                 f"/api/refplayer/v1/rtsp-timeshift/resolve?r2h-token={token}"
