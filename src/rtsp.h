@@ -69,7 +69,7 @@ typedef struct {
 /* Time conversion buffers - for playseek time formatting */
 #define RTSP_TIME_STRING_SIZE 64
 
-/* Archive requests may receive media before the PLAY Range acknowledgement.
+/* Archive requests may receive media before the successful PLAY response.
  * Retain a small bounded window until that control-plane result arrives. */
 #define RTSP_ARCHIVE_PENDING_PACKET_LIMIT 3
 
@@ -181,13 +181,6 @@ typedef struct {
   int64_t refplayer_play_clock_start;
   int64_t refplayer_play_clock_end;
   int refplayer_play_scale_compatible;
-  int refplayer_archive_ack_valid;
-  int refplayer_archive_ack_open_ended;
-  service_refplayer_range_kind_t refplayer_archive_ack_kind;
-  double refplayer_archive_ack_npt_start;
-  double refplayer_archive_ack_npt_end;
-  int64_t refplayer_archive_ack_clock_start;
-  int64_t refplayer_archive_ack_clock_end;
   int refplayer_sdp_range_valid;
   int refplayer_sdp_clock_open_ended;
   service_refplayer_range_kind_t refplayer_sdp_range_kind;

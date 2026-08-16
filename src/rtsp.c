@@ -111,7 +111,7 @@ static void rtsp_release_archive_pending_packets(rtsp_session_t *session) {
   session->archive_pending_packet_count = 0;
 }
 
-/* Takes ownership until PLAY acknowledges or rejects the archive target. */
+/* Takes ownership until PLAY succeeds or rejects the archive request. */
 static int rtsp_hold_archive_pending_packet(rtsp_session_t *session, buffer_ref_t *packet) {
   if (!session || !packet || session->archive_pending_packet_count >= RTSP_ARCHIVE_PENDING_PACKET_LIMIT)
     return -1;
@@ -186,36 +186,20 @@ static void rtsp_finalize_refplayer_http_commit(rtsp_session_t *session, connect
     (void)refplayer_rtsp_timeshift_publish(session->refplayer_source_id, &range, NULL);
 }
 
-/* Commit an archive representation exactly once. Live media uses the ordinary
- * rtp2httpd path; only a typed archive target waits for PLAY acknowledgement. */
+/* Commit an archive representation exactly once.  Source admission already
+ * proved the RTSP clock/NPT coordinate and resolve already bounded the target
+ * against that source-scoped observation.  Many IPTV servers do not repeat a
+ * Range header on every successful PLAY, so archive playback follows upstream
+ * rtp2httpd semantics here: successful PLAY plus MPEG-TS media is sufficient.
+ * A returned Range remains metadata; it is not a second admission gate. */
 static int rtsp_try_commit_archive_media(rtsp_session_t *session, connection_t *conn) {
   int bytes_forwarded;
   if (!session || !conn || !session->refplayer_timeshift_enabled || !session->refplayer_archive_request ||
       session->first_media_received || session->archive_commit_failed ||
       !session->play_response_confirmed || !session->media_evidence_confirmed)
     return 0;
-  {
-    int covers_target = session->refplayer_play_scale_compatible && session->refplayer_archive_ack_valid &&
-                        session->refplayer_archive_ack_kind == session->refplayer_range_kind;
-    if (covers_target && session->refplayer_range_kind == SERVICE_REFPLAYER_RANGE_NPT)
-      covers_target = session->refplayer_archive_ack_open_ended
-                          ? fabs(session->refplayer_npt_target - session->refplayer_archive_ack_npt_start) <= 5e-10
-                          : session->refplayer_npt_target >= session->refplayer_archive_ack_npt_start &&
-                                session->refplayer_npt_target <= session->refplayer_archive_ack_npt_end;
-    if (covers_target && session->refplayer_range_kind == SERVICE_REFPLAYER_RANGE_CLOCK)
-      covers_target = session->refplayer_archive_ack_open_ended
-                          ? session->refplayer_clock_target == session->refplayer_archive_ack_clock_start
-                          : session->refplayer_clock_target >= session->refplayer_archive_ack_clock_start &&
-                                session->refplayer_clock_target <= session->refplayer_archive_ack_clock_end;
-    if (!covers_target) {
-      logger(LOG_WARN, "RTSP: Archive PLAY response did not acknowledge the requested typed target");
-      rtsp_release_archive_pending_packets(session);
-      session->archive_commit_failed = 1;
-      return STREAM_EVENT_UNSUPPORTED_MEDIA;
-    }
-  }
   session->first_media_received = 1;
-  logger(LOG_DEBUG, "RTSP: Committing archive media after successful PLAY Range acknowledgement");
+  logger(LOG_DEBUG, "RTSP: Committing archive media after successful PLAY and MPEG-TS evidence");
   bytes_forwarded = rtsp_flush_archive_pending_packets(session, conn);
   if (bytes_forwarded == STREAM_EVENT_UNSUPPORTED_MEDIA) {
     session->archive_commit_failed = 1;
@@ -2290,7 +2274,7 @@ static int rtsp_process_interleaved_buffer(rtsp_session_t *session, connection_t
               return STREAM_EVENT_UNSUPPORTED_MEDIA;
             }
             session->media_evidence_confirmed = 1;
-            logger(LOG_DEBUG, "RTSP: Archive media arrived over TCP, waiting for PLAY Range acknowledgement");
+            logger(LOG_DEBUG, "RTSP: Archive media arrived over TCP, waiting for successful PLAY");
             int commit_result = rtsp_try_commit_archive_media(session, conn);
             if (commit_result == STREAM_EVENT_UNSUPPORTED_MEDIA)
               return STREAM_EVENT_UNSUPPORTED_MEDIA;
@@ -2455,7 +2439,7 @@ int rtsp_handle_udp_rtp_data(rtsp_session_t *session, connection_t *conn) {
         return STREAM_EVENT_UNSUPPORTED_MEDIA;
       }
       session->media_evidence_confirmed = 1;
-      logger(LOG_DEBUG, "RTSP: Archive media arrived over UDP, waiting for PLAY Range acknowledgement");
+      logger(LOG_DEBUG, "RTSP: Archive media arrived over UDP, waiting for successful PLAY");
       int commit_result = rtsp_try_commit_archive_media(session, conn);
       if (commit_result == STREAM_EVENT_UNSUPPORTED_MEDIA)
         return STREAM_EVENT_UNSUPPORTED_MEDIA;
@@ -3281,8 +3265,6 @@ static void rtsp_parse_play_metadata(rtsp_session_t *session, const char *respon
   metadata = rtsp_metadata(session);
   session->refplayer_play_range_valid = 0;
   session->refplayer_play_range_invalid = 0;
-  session->refplayer_archive_ack_valid = 0;
-  session->refplayer_archive_ack_open_ended = 0;
   session->refplayer_play_scale_compatible = 1;
 
   scale_header = rtsp_find_header(response, "Scale");
@@ -3316,8 +3298,7 @@ static void rtsp_parse_play_metadata(rtsp_session_t *session, const char *respon
     free(range_header);
   } else if (range_header && range_count == 1) {
     refplayer_rtsp_observation_t parsed_range;
-    refplayer_rtsp_observation_t parsed_ack;
-    int archive_open_ended = 0;
+    int range_open_ended = 0;
     int legal_open_ended = 0;
     size_t len = strlen(range_header);
     int valid = len > 0 && (!metadata || len < sizeof(metadata->playback_range));
@@ -3331,8 +3312,8 @@ static void rtsp_parse_play_metadata(rtsp_session_t *session, const char *respon
       memcpy(metadata->playback_range, range_header, len + 1);
     }
     legal_open_ended = valid &&
-                       refplayer_rtsp_parse_archive_ack(range_header, &parsed_ack, &archive_open_ended) == 0 &&
-                       archive_open_ended;
+                       refplayer_rtsp_parse_response_range(range_header, &parsed_range, &range_open_ended) == 0 &&
+                       range_open_ended;
     if (valid && session->refplayer_play_scale_compatible &&
         refplayer_rtsp_parse_play_range(range_header, &parsed_range) == 0) {
       session->refplayer_play_range_valid = 1;
@@ -3347,20 +3328,6 @@ static void rtsp_parse_play_metadata(rtsp_session_t *session, const char *respon
       }
     } else if (!session->refplayer_archive_request && !legal_open_ended) {
       session->refplayer_play_range_invalid = 1;
-    }
-    if (valid && session->refplayer_play_scale_compatible && session->refplayer_archive_request &&
-        refplayer_rtsp_parse_archive_ack(range_header, &parsed_range, &archive_open_ended) == 0) {
-      session->refplayer_archive_ack_valid = 1;
-      session->refplayer_archive_ack_open_ended = archive_open_ended;
-      if (parsed_range.kind == REFPLAYER_RTSP_RANGE_NPT) {
-        session->refplayer_archive_ack_kind = SERVICE_REFPLAYER_RANGE_NPT;
-        session->refplayer_archive_ack_npt_start = parsed_range.npt_start;
-        session->refplayer_archive_ack_npt_end = parsed_range.npt_end;
-      } else {
-        session->refplayer_archive_ack_kind = SERVICE_REFPLAYER_RANGE_CLOCK;
-        session->refplayer_archive_ack_clock_start = parsed_range.clock_start_epoch;
-        session->refplayer_archive_ack_clock_end = parsed_range.clock_end_epoch;
-      }
     }
     free(range_header);
   }

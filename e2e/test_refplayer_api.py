@@ -161,7 +161,6 @@ class TestRefPlayerRTSPTimeshift:
             time.gmtime(second_target + timezone_offset),
         )
         acknowledged_clock = wire_clock[:-1] + ".32Z"
-        second_acknowledged_clock = second_wire_clock[:-1] + ".68Z"
         sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=live\r\nt=0 0\r\na=range:clock=0-\r\nm=video 0 MP2T/AVP 33\r\n"
         rtsp = MockRTSPServer(
             num_packets=500,
@@ -171,7 +170,7 @@ class TestRefPlayerRTSPTimeshift:
             play_response_headers_sequence=[
                 [],
                 [("Range", f"clock={acknowledged_clock}-")],
-                [("Range", f"clock={second_acknowledged_clock}-")],
+                [],
             ],
         )
         rtsp.start()
@@ -256,7 +255,7 @@ rtsp://127.0.0.1:{rtsp.port}/stream
             rtsp.stop()
 
     @pytest.mark.parametrize("ack_delta", [-(3 * 3600), 3600])
-    def test_open_clock_archive_rejects_unsafe_clamps(self, r2h_binary, ack_delta):
+    def test_open_clock_archive_range_echo_does_not_gate_playback(self, r2h_binary, ack_delta):
         now = int(time.time())
         requested_actual = now - 2 * 3600
         timezone_offset = 8 * 3600
@@ -312,7 +311,12 @@ rtsp://127.0.0.1:{rtsp.port}/stream
                 read_bytes=4096,
                 timeout=15,
             )
-            assert status != 200
+            # The source-level capability and bounded resolve authorize the
+            # request.  PLAY Range is optional response metadata in RTSP and
+            # must not become a second admission gate: upstream rtp2httpd
+            # forwards successful PLAY media even when a server omits or
+            # rewrites that header.
+            assert status == 200
         finally:
             process.stop()
             rtsp.stop()

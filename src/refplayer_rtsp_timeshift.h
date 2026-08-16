@@ -50,12 +50,11 @@ int refplayer_rtsp_parse_play_range(const char *value, refplayer_rtsp_observatio
 int refplayer_rtsp_parse_open_clock_range(const char *value,
                                           refplayer_rtsp_observation_t *range);
 
-/* Archive PLAY replies are acknowledgements, not source-window evidence. A
- * server may acknowledge the requested seek as either a finite range or an
- * open-ended ``target-`` range. ``open_ended`` distinguishes the latter; its
- * parsed start is returned in the matching start field. */
-int refplayer_rtsp_parse_archive_ack(const char *value, refplayer_rtsp_observation_t *range,
-                                     int *open_ended);
+/* Parse a finite or open-ended PLAY response Range for metadata
+ * classification.  The response is not an archive admission gate: RTSP
+ * servers are allowed to omit it on a successful PLAY. */
+int refplayer_rtsp_parse_response_range(const char *value, refplayer_rtsp_observation_t *range,
+                                        int *open_ended);
 
 /* Publish only after the caller has jointly proved PLAY success and three
  * MPEG-TS packets. The cache stores facts, never upstream URLs or credentials. */

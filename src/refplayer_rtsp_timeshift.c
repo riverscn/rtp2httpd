@@ -419,8 +419,8 @@ int refplayer_rtsp_parse_open_clock_range(const char *value,
   return 0;
 }
 
-int refplayer_rtsp_parse_archive_ack(const char *value, refplayer_rtsp_observation_t *range,
-                                     int *open_ended) {
+int refplayer_rtsp_parse_response_range(const char *value, refplayer_rtsp_observation_t *range,
+                                        int *open_ended) {
   const char *separator;
   char start[64];
   size_t consumed;
