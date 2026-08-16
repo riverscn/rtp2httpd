@@ -155,17 +155,8 @@ static void rtsp_finalize_refplayer_http_commit(rtsp_session_t *session, connect
       !conn->headers_sent)
     return;
   session->refplayer_http_committed = 1;
-  if (session->refplayer_archive_request) {
-    if (session->refplayer_archive_clamp_learned && session->refplayer_source_id[0]) {
-      memset(&range, 0, sizeof(range));
-      range.kind = REFPLAYER_RTSP_RANGE_CLOCK;
-      range.clock_start_epoch = session->refplayer_archive_clamp_clock_start;
-      range.clock_end_epoch = session->refplayer_archive_clamp_clock_end;
-      if (refplayer_rtsp_timeshift_publish(session->refplayer_source_id, &range, NULL) == 0)
-        logger(LOG_INFO, "RTSP: Learned effective archive clock window after upstream clamp");
-    }
+  if (session->refplayer_archive_request)
     return;
-  }
   if (!session->refplayer_play_scale_compatible ||
       session->refplayer_play_range_invalid || !session->refplayer_source_id[0] ||
       !session->refplayer_session_id[0] ||
@@ -216,28 +207,6 @@ static int rtsp_try_commit_archive_media(rtsp_session_t *session, connection_t *
                           ? session->refplayer_clock_target == session->refplayer_archive_ack_clock_start
                           : session->refplayer_clock_target >= session->refplayer_archive_ack_clock_start &&
                                 session->refplayer_clock_target <= session->refplayer_archive_ack_clock_end;
-    if (!covers_target && session->refplayer_range_kind == SERVICE_REFPLAYER_RANGE_CLOCK &&
-        session->refplayer_play_scale_compatible && session->refplayer_archive_ack_valid &&
-        session->refplayer_archive_ack_kind == SERVICE_REFPLAYER_RANGE_CLOCK &&
-        session->refplayer_archive_ack_open_ended && session->refplayer_clock_observation_open_ended) {
-      int64_t observed_wire = session->refplayer_clock_observed_at;
-      int offset = session->refplayer_clock_timezone_offset_seconds;
-      if ((offset > 0 && observed_wire <= INT64_MAX - offset) ||
-          (offset < 0 && observed_wire >= INT64_MIN - offset) || offset == 0) {
-        observed_wire += offset;
-        if (session->refplayer_archive_ack_clock_start > session->refplayer_clock_target &&
-            session->refplayer_archive_ack_clock_start <= observed_wire) {
-          int64_t learned_start = session->refplayer_archive_ack_clock_start - offset;
-          if (learned_start >= 0 && learned_start < session->refplayer_clock_observed_at) {
-            covers_target = 1;
-            session->refplayer_archive_clamp_learned = 1;
-            session->refplayer_archive_clamp_clock_start = learned_start;
-            session->refplayer_archive_clamp_clock_end = session->refplayer_clock_observed_at;
-            logger(LOG_INFO, "RTSP: Upstream clamped archive request forward to its effective retention boundary");
-          }
-        }
-      }
-    }
     if (!covers_target) {
       logger(LOG_WARN, "RTSP: Archive PLAY response did not acknowledge the requested typed target");
       rtsp_release_archive_pending_packets(session);
